@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { AlertTriangle, ArrowRight, Check, FileAudio, LockKeyhole, Mic, Play, ShieldCheck, Upload, Waves, X } from "lucide-react";
+import { AlertTriangle, ArrowRight, Check, FileAudio, LockKeyhole, Mic, Moon, Play, ShieldCheck, Sun, Upload, Waves, X } from "lucide-react";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -43,6 +43,7 @@ export default function Home() {
   const [callOpen, setCallOpen] = useState(false);
   const [verification, setVerification] = useState(false);
   const [activeStep, setActiveStep] = useState(0);
+  const [theme, setTheme] = useState<"light" | "dark">("light");
 
   useEffect(() => {
     const items = document.querySelectorAll(".reveal");
@@ -52,6 +53,13 @@ export default function Home() {
     items.forEach((item) => observer.observe(item));
     return () => observer.disconnect();
   }, []);
+
+  useEffect(() => {
+    document.documentElement.style.colorScheme = theme;
+    return () => {
+      document.documentElement.style.colorScheme = "light";
+    };
+  }, [theme]);
 
   async function analyzeFile(file?: File) {
     if (!file) return;
@@ -78,7 +86,7 @@ export default function Home() {
   const title = busy ? "Analyzing..." : result.status === "suspicious" ? "Elevated signal" : result.status === "human" ? "Lower signal" : "Needs context";
 
   return (
-    <main className="vxy-shell">
+    <main className={`vxy-shell theme-${theme}`}>
       <div className="vxy-frame">
         <header className="vxy-header">
           <nav className="vxy-nav" aria-label="Main navigation">
@@ -90,6 +98,10 @@ export default function Home() {
               <button onClick={() => setModal("contact")}>Contact</button>
             </div>
             <div className="vxy-nav-actions">
+              <button className="theme-toggle" onClick={() => setTheme(theme === "light" ? "dark" : "light")} aria-label={`Switch to ${theme === "light" ? "dark" : "light"} theme`} aria-pressed={theme === "dark"}>
+                {theme === "light" ? <Moon size={16} /> : <Sun size={16} />}
+                <span>{theme === "light" ? "Dark" : "Light"}</span>
+              </button>
               <button className="vxy-pill secondary" onClick={() => setModal("login")}>Login</button>
               <button className="vxy-pill primary" onClick={() => scrollToSection("analyze")}>Get Started <ArrowRight size={15} /></button>
             </div>

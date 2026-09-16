@@ -8,7 +8,7 @@ import wave
 from time import perf_counter
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import FRONTEND_ORIGIN, MAX_WINDOWS
@@ -39,8 +39,9 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="VOXY API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN, "http://localhost:3000"],
-    allow_credentials=True,
+    # Public hackathon demo: no cookies/authentication are used.
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -102,7 +103,7 @@ async def analyze(audio: UploadFile = File(...)) -> AnalysisResponse:
 
 
 def decode_live_wav(payload: bytes) -> np.ndarray:
-    """Decode the frontend's fixed 16 kHz mono PCM snapshot without librosa/ffmpeg."""
+    """Decode a browser-generated fixed 16 kHz mono PCM snapshot."""
     with wave.open(BytesIO(payload), "rb") as wav:
         channels = wav.getnchannels()
         sample_width = wav.getsampwidth()
@@ -120,6 +121,48 @@ def decode_live_wav(payload: bytes) -> np.ndarray:
     if audio.size == 0:
         raise ValueError("Live audio snapshot was empty")
     return audio
+
+
+@app.post("/api/live")
+async def analyze_live_snapshot(audio: bytes = Body(...)) -> dict:
+    """Run one fixed live microphone window over ordinary HTTPS."""
+    assert service is not None
+    if not service.loaded:
+        raise HTTPException(503, "AASIST detector is unavailable")
+    if not audio:
+        raise HTTPException(400, "Live audio snapshot was empty.")
+
+    try:
+        waveform = decode_live_wav(audio)
+        quality = quality_check(waveform)
+        if quality == "insufficient":
+            raise HTTPException(422, "Live audio contains insufficient speech signal.")
+
+        started = perf_counter()
+        score = await asyncio.to_thread(service.predict_window, waveform)
+        elapsed_ms = round((perf_counter() - started) * 1000.0)
+        value = round(float(score), 1)
+        risk, level = calculate_risk(value, 1, 100.0, quality)
+        print(f"VOXY live HTTP: AASIST inference completed in {elapsed_ms} ms score={value:.1f}")
+
+        return {
+            "window_id": 1,
+            "synthetic_score": value,
+            "risk_score": risk,
+            "risk_level": level,
+            "status": "suspicious" if value >= 60 else "human" if value < 35 else "uncertain",
+            "stability": 100.0,
+            "audio_quality": quality,
+            "windows_analyzed": 1,
+            "mode": service.mode,
+            "detector": service.detector,
+            "timeline": [value],
+            "inference_ms": elapsed_ms,
+        }
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(422, f"Live analysis failed: {error}") from error
 
 
 @app.websocket("/ws/analyze")

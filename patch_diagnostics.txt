@@ -1,0 +1,10 @@
+helper_marker=True
+verification_anchor=True
+live_function=True
+graph_marker=True
+webm_suffix=True
+media_recorder=True
+stop_segments=True
+live_listening=True
+PAGE_SHA_BYTES=26026
+MAIN_SHA_BYTES=6891

@@ -2,12 +2,11 @@
 
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, ArrowRight, Check, FileAudio, LockKeyhole, Mic, Moon, Play, ShieldCheck, Sun, Upload, Waves, X } from "lucide-react";
-import { getWebSocketUrl } from "./websocket";
 
 const API = process.env.NEXT_PUBLIC_API_URL?.trim() || (process.env.NODE_ENV === "development" ? "http://localhost:8000" : "");
 
 function logWebSocket(message: string, details?: unknown) {
-  if (process.env.NODE_ENV === "development") console.info(`[VOXY WebSocket] ${message}`, details ?? "");
+  if (process.env.NODE_ENV === "development") console.info(`[VOXY Live] ${message}`, details ?? "");
 }
 
 type Result = {
@@ -21,12 +20,13 @@ type Result = {
   detector?: string;
   model_message?: string;
   timeline: number[];
+  inference_ms?: number;
 };
 
 const demoResults: Record<string, Result> = {
-  human: { status: "human", synthetic_score: 18, risk_score: 12, risk_level: "LOW", windows_analyzed: 4, audio_quality: "good", mode: "demo", model_message: "SIMULATION - deterministic demo output", timeline: [14, 21, 16, 18] },
-  synthetic: { status: "suspicious", synthetic_score: 91, risk_score: 88, risk_level: "CRITICAL", windows_analyzed: 4, audio_quality: "good", mode: "demo", model_message: "SIMULATION - deterministic demo output", timeline: [84, 93, 89, 96] },
-  uncertain: { status: "uncertain", synthetic_score: 52, risk_score: 43, risk_level: "MODERATE", windows_analyzed: 3, audio_quality: "good", mode: "demo", model_message: "SIMULATION - deterministic demo output", timeline: [45, 59, 51] },
+  human: { status: "human", synthetic_score: 18, risk_score: 18, risk_level: "LOW", windows_analyzed: 4, audio_quality: "good", mode: "demo", model_message: "SIMULATION - deterministic demo output", timeline: [14, 21, 16, 18] },
+  synthetic: { status: "suspicious", synthetic_score: 91, risk_score: 91, risk_level: "CRITICAL", windows_analyzed: 4, audio_quality: "good", mode: "demo", model_message: "SIMULATION - deterministic demo output", timeline: [84, 93, 89, 96] },
+  uncertain: { status: "uncertain", synthetic_score: 52, risk_score: 52, risk_level: "MODERATE", windows_analyzed: 3, audio_quality: "good", mode: "demo", model_message: "SIMULATION - deterministic demo output", timeline: [45, 59, 51] },
 };
 
 const liveListeningResult: Result = {
@@ -78,7 +78,7 @@ function encodeWav(samples: Float32Array, sampleRate: number): ArrayBuffer {
   const write = (offset: number, value: string) => {
     for (let index = 0; index < value.length; index += 1) view.setUint8(offset + index, value.charCodeAt(index));
   };
-  write(0, 'RIFF'); write(8, 'WAVE'); write(12, 'fmt '); write(36, 'data');
+  write(0, "RIFF"); write(8, "WAVE"); write(12, "fmt "); write(36, "data");
   view.setUint32(4, 36 + samples.length * 2, true);
   view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
   view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true);
@@ -100,11 +100,8 @@ export default function Home() {
   const [liveActive, setLiveActive] = useState(false);
   const [liveError, setLiveError] = useState<string | null>(null);
   const [liveSeconds, setLiveSeconds] = useState(0);
-  const mediaRecorder = useRef<MediaRecorder | null>(null);
   const mediaStream = useRef<MediaStream | null>(null);
-  const socket = useRef<WebSocket | null>(null);
   const intentionalStop = useRef(false);
-  const stopSegments = useRef<(() => void) | null>(null);
   const [verification, setVerification] = useState(false);
   const audioContext = useRef<AudioContext | null>(null);
   const audioSource = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -157,26 +154,46 @@ export default function Home() {
     if (!file) return;
     setBusy(true);
     setAnalysisError(null);
+    setLiveError(null);
+    setResult({ ...liveListeningResult, mode: "live", model_message: `UPLOADING · ${file.name} · AASIST analysis in progress...` });
     scrollToSection("analyze");
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 180000);
     try {
       if (!API) throw new Error("Backend URL is missing. Set NEXT_PUBLIC_API_URL and rebuild the frontend.");
-      const body = new FormData();
-      body.append("audio", file);
-      const response = await fetch(`${API}/api/analyze`, { method: "POST", body });
+      let response: Response | null = null;
+      let lastError: unknown = null;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          const body = new FormData();
+          body.append("audio", file);
+          response = await fetch(`${API}/api/analyze`, { method: "POST", body, signal: controller.signal, cache: "no-store" });
+          if (response.ok) break;
+        } catch (error) {
+          lastError = error;
+        }
+        if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 1500));
+      }
+      if (!response) throw new Error(lastError instanceof Error ? `${lastError.message} · ${API}` : `Failed to reach VOXY backend · ${API}`);
       if (!response.ok) {
         let message = `Audio analysis failed (${response.status}).`;
         try {
           const payload = await response.json() as { detail?: string };
           if (payload.detail) message = payload.detail;
-        } catch {
-          // Keep the status-based message when the server response is not JSON.
-        }
+        } catch {}
         throw new Error(message);
       }
-      setResult(await response.json());
+      setResult(await response.json() as Result);
     } catch (error) {
-      setAnalysisError(error instanceof Error ? error.message : "Audio analysis failed.");
+      setAnalysisError(
+        error instanceof DOMException && error.name === "AbortError"
+          ? "Audio analysis timed out after 180 seconds."
+          : error instanceof Error
+            ? error.message
+            : "Audio analysis failed.",
+      );
     } finally {
+      window.clearTimeout(timeout);
       setBusy(false);
     }
   }
@@ -184,6 +201,7 @@ export default function Home() {
   function chooseDemo(kind: keyof typeof demoResults) {
     stopLiveSimulation(true);
     setAnalysisError(null);
+    setLiveError(null);
     setResult(demoResults[kind]);
     scrollToSection("analyze");
   }
@@ -196,82 +214,140 @@ export default function Home() {
     try { silentGain.current?.disconnect(); } catch {}
     try { audioSource.current?.disconnect(); } catch {}
     audioSource.current = null; analyser.current = null; silentGain.current = null;
-    if (audioContext.current && audioContext.current.state !== 'closed') void audioContext.current.close();
+    if (audioContext.current && audioContext.current.state !== "closed") void audioContext.current.close();
     audioContext.current = null; pcmChunks.current = []; pcmSampleCount.current = 0; modelRequestPending.current = false;
     mediaStream.current?.getTracks().forEach((track) => track.stop());
-    socket.current?.close(1000, 'client stopped');
-    mediaStream.current = null; socket.current = null; setLiveActive(false);
+    mediaStream.current = null;
+    setLiveActive(false);
   }
 
   async function startLiveSimulation() {
-    setLiveError(null); setAnalysisError(null); setResult(liveListeningResult);
-    pcmChunks.current = []; pcmSampleCount.current = 0; modelRequestPending.current = false;
-    if (!navigator.mediaDevices?.getUserMedia || !window.AudioContext) { setLiveError('This browser does not support live microphone analysis.'); return; }
+    setLiveError(null);
+    setAnalysisError(null);
+    setResult(liveListeningResult);
+    pcmChunks.current = [];
+    pcmSampleCount.current = 0;
+    modelRequestPending.current = false;
+    if (!API) { setLiveError("Backend URL is missing. Set NEXT_PUBLIC_API_URL and rebuild the frontend."); return; }
+    if (!navigator.mediaDevices?.getUserMedia || !window.AudioContext) { setLiveError("This browser does not support live microphone analysis."); return; }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const liveSocket = new WebSocket(getWebSocketUrl(API, window.location.protocol));
-      const context = new AudioContext(); await context.resume();
+      const context = new AudioContext({ sampleRate: LIVE_SAMPLE_RATE });
+      await context.resume();
       const source = context.createMediaStreamSource(stream);
-      const analyserNode = context.createAnalyser(); analyserNode.fftSize = 2048; analyserNode.smoothingTimeConstant = 0.12;
-      const processor = context.createScriptProcessor(4096, 1, 1); const silent = context.createGain(); silent.gain.value = 0;
-      source.connect(analyserNode); source.connect(processor); processor.connect(silent); silent.connect(context.destination);
-      mediaStream.current = stream; socket.current = liveSocket; audioContext.current = context; audioSource.current = source; analyser.current = analyserNode; pcmProcessor.current = processor; silentGain.current = silent; intentionalStop.current = false;
+      const analyserNode = context.createAnalyser();
+      analyserNode.fftSize = 2048;
+      analyserNode.smoothingTimeConstant = 0.12;
+      const processor = context.createScriptProcessor(4096, 1, 1);
+      const silent = context.createGain();
+      silent.gain.value = 0;
+      source.connect(analyserNode);
+      source.connect(processor);
+      processor.connect(silent);
+      silent.connect(context.destination);
+      mediaStream.current = stream;
+      audioContext.current = context;
+      audioSource.current = source;
+      analyser.current = analyserNode;
+      pcmProcessor.current = processor;
+      silentGain.current = silent;
+      intentionalStop.current = false;
 
       const drawWaveform = () => {
-        const canvas = waveformCanvas.current; const current = analyser.current;
+        const canvas = waveformCanvas.current;
+        const current = analyser.current;
         if (!canvas || !current) return;
-        const dpr = window.devicePixelRatio || 1; const width = Math.max(1, Math.floor(canvas.clientWidth * dpr)); const height = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+        const dpr = window.devicePixelRatio || 1;
+        const width = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+        const height = Math.max(1, Math.floor(canvas.clientHeight * dpr));
         if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
-        const ctx = canvas.getContext('2d'); if (!ctx) return;
-        const data = new Uint8Array(current.fftSize); current.getByteTimeDomainData(data); ctx.clearRect(0, 0, width, height);
-        ctx.strokeStyle = 'rgba(198,233,61,.95)'; ctx.lineWidth = Math.max(1.5, dpr * 1.5); ctx.beginPath();
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        const data = new Uint8Array(current.fftSize);
+        current.getByteTimeDomainData(data);
+        ctx.clearRect(0, 0, width, height);
+        ctx.strokeStyle = "rgba(198,233,61,.95)";
+        ctx.lineWidth = Math.max(1.5, dpr * 1.5);
+        ctx.beginPath();
         const dx = width / data.length;
-        for (let index = 0; index < data.length; index += 1) { const x = index * dx; const y = height / 2 + ((data[index] - 128) / 128) * height * 0.42; if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); }
-        ctx.stroke(); waveformFrame.current = window.requestAnimationFrame(drawWaveform);
+        for (let index = 0; index < data.length; index += 1) {
+          const x = index * dx;
+          const y = height / 2 + ((data[index] - 128) / 128) * height * 0.42;
+          if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+        waveformFrame.current = window.requestAnimationFrame(drawWaveform);
       };
 
       processor.onaudioprocess = (event) => {
-        const copy = new Float32Array(event.inputBuffer.getChannelData(0)); pcmChunks.current.push(copy); pcmSampleCount.current += copy.length;
+        const copy = new Float32Array(event.inputBuffer.getChannelData(0));
+        pcmChunks.current.push(copy);
+        pcmSampleCount.current += copy.length;
         const keep = Math.ceil(context.sampleRate * (LIVE_WINDOW_SECONDS + 0.5));
-        while (pcmChunks.current.length > 1 && pcmSampleCount.current > keep) { const removed = pcmChunks.current.shift(); if (removed) pcmSampleCount.current -= removed.length; }
+        while (pcmChunks.current.length > 1 && pcmSampleCount.current > keep) {
+          const removed = pcmChunks.current.shift();
+          if (removed) pcmSampleCount.current -= removed.length;
+        }
       };
 
       const buildWindow = () => {
-        const needed = Math.ceil(context.sampleRate * LIVE_WINDOW_SECONDS); if (pcmSampleCount.current < needed) return null;
-        const joined = new Float32Array(pcmSampleCount.current); let offset = 0; for (const chunk of pcmChunks.current) { joined.set(chunk, offset); offset += chunk.length; }
-        return downsampleToTarget(joined.subarray(Math.max(0, joined.length - needed)));
-      };
-      const sendWindow = () => {
-        if (liveSocket.readyState !== WebSocket.OPEN || modelRequestPending.current) return;
-        const samples = buildWindow(); if (!samples) return;
-        modelRequestPending.current = true; liveSocket.send(encodeWav(samples, LIVE_SAMPLE_RATE));
+        const needed = Math.ceil(context.sampleRate * LIVE_WINDOW_SECONDS);
+        if (pcmSampleCount.current < needed) return null;
+        const joined = new Float32Array(pcmSampleCount.current);
+        let offset = 0;
+        for (const chunk of pcmChunks.current) { joined.set(chunk, offset); offset += chunk.length; }
+        const recent = joined.subarray(Math.max(0, joined.length - needed));
+        return context.sampleRate === LIVE_SAMPLE_RATE ? downsampleToTarget(recent) : downsampleToTarget(recent);
       };
 
-      liveSocket.onopen = () => { setLiveSeconds(0); setLiveActive(true); waveformFrame.current = window.requestAnimationFrame(drawWaveform); snapshotTimer.current = window.setInterval(sendWindow, 1000); };
-      liveSocket.onmessage = (event) => {
-        modelRequestPending.current = false;
+      const sendWindow = async () => {
+        if (modelRequestPending.current) return;
+        const samples = buildWindow();
+        if (!samples) return;
+        modelRequestPending.current = true;
         try {
-          if (typeof event.data !== 'string') return;
-          const update = JSON.parse(event.data) as Result & { error?: string };
-          if (update.error) { setLiveError(update.error); return; }
-          setResult({ ...update, mode: 'pretrained', model_message: 'LIVE MODEL ANALYSIS - rolling 4-second AASIST window' });
-        } catch (error) { logWebSocket('invalid server message', error); }
+          const response = await fetch(`${API}/api/live`, {
+            method: "POST",
+            headers: { "Content-Type": "audio/wav" },
+            body: encodeWav(samples, LIVE_SAMPLE_RATE),
+            cache: "no-store",
+          });
+          if (!response.ok) {
+            let message = `Live analysis failed (${response.status}).`;
+            try {
+              const payload = await response.json() as { detail?: string };
+              if (payload.detail) message = payload.detail;
+            } catch {}
+            throw new Error(message);
+          }
+          const update = await response.json() as Result & { inference_ms?: number };
+          setResult({
+            ...update,
+            mode: "pretrained",
+            model_message: update.inference_ms
+              ? `LIVE MODEL ANALYSIS · real AASIST window · ${update.inference_ms} ms`
+              : "LIVE MODEL ANALYSIS · real AASIST window",
+          });
+          setLiveError(null);
+        } catch (error) {
+          setLiveError(error instanceof Error ? error.message : "Live model request failed.");
+        } finally {
+          modelRequestPending.current = false;
+        }
       };
-      liveSocket.onerror = () => logWebSocket('onerror', 'Network error or connection refused');
-      liveSocket.onclose = (event) => {
-        modelRequestPending.current = false;
-        if (snapshotTimer.current !== null) { window.clearInterval(snapshotTimer.current); snapshotTimer.current = null; }
-        if (waveformFrame.current !== null) { window.cancelAnimationFrame(waveformFrame.current); waveformFrame.current = null; }
-        if (intentionalStop.current || event.code === 1000) setLiveError(null);
-        else if (event.code === 1011 && event.reason.toLowerCase().includes('detector')) setLiveError('Backend closed the connection because the AASIST detector is unavailable.');
-        else if (event.code === 1006) setLiveError('WebSocket connection refused or interrupted. Check that the backend is running and reachable.');
-        else if (event.reason) setLiveError(`Backend closed the live connection (${event.code}): ${event.reason}`);
-        else setLiveError(`Live connection closed unexpectedly (code ${event.code}).`);
-        setLiveActive(false); mediaStream.current?.getTracks().forEach((track) => track.stop());
-        if (audioContext.current && audioContext.current.state !== 'closed') void audioContext.current.close(); audioContext.current = null;
-      };
+
+      setLiveSeconds(0);
+      setLiveActive(true);
+      waveformFrame.current = window.requestAnimationFrame(drawWaveform);
+      snapshotTimer.current = window.setInterval(() => { void sendWindow(); }, 500);
     } catch (error) {
-      setLiveError(error instanceof DOMException && error.name === 'NotAllowedError' ? 'Microphone permission was denied.' : error instanceof Error ? error.message : 'Unable to start microphone analysis.');
+      setLiveError(
+        error instanceof DOMException && error.name === "NotAllowedError"
+          ? "Microphone permission was denied."
+          : error instanceof Error
+            ? error.message
+            : "Unable to start microphone analysis.",
+      );
       stopLiveSimulation();
     }
   }
@@ -377,8 +453,8 @@ export default function Home() {
 
         <section className="vxy-section analyze-section reveal" id="analyze">
           <div className="section-heading"><div><span className="kicker">Live workspace</span><h2>Analyze a voice.</h2></div><p>Upload an audio clip or choose a labelled simulation. Demo values are never presented as genuine model predictions.</p></div>
-          <div className="analyze-layout"><div className="upload-card"><div className="card-title"><FileAudio size={20} /><h3>Voice input</h3></div><p className="muted">WAV, MP3, M4A, or browser WebM. Audio is processed temporarily.</p><label className="dropzone"><Upload size={27} /><strong>Choose a recording</strong><span>Send it to the VOXY pipeline</span><input type="file" accept="audio/*" onChange={(event) => analyzeFile(event.target.files?.[0])} /></label><div className="demo-row"><button onClick={() => chooseDemo("human")}>Human / demo</button><button onClick={() => chooseDemo("synthetic")}>Synthetic / demo</button><button onClick={() => chooseDemo("uncertain")}>Uncertain / demo</button></div><button className="text-action" onClick={() => { if (liveActive) stopLiveSimulation(true); else setCallOpen(!callOpen); }}><Mic size={16} /> {liveActive ? "Stop microphone simulation" : callOpen ? "Close microphone simulation" : "Open microphone simulation"}</button>{callOpen && <div className="inline-note"><strong>Browser Microphone Simulation</strong><p>Audio is streamed to VOXY for live AASIST analysis. It does not intercept cellular calls.</p>{liveActive ? <p className="live-status"><span className="live-dot" /> Listening · {liveSeconds}s</p> : <button className="vxy-pill primary" onClick={startLiveSimulation}>Start microphone analysis</button>}{liveError && <p role="alert">{liveError}</p>}</div>}</div>
-            <div className="result-card" aria-live="polite"><div className="result-top"><div><span className="kicker">Voice assessment</span><h3>{title}</h3></div><span className="badge">{badge}</span></div><div className="score">{liveActive && result.windows_analyzed === 0 ? "—" : Math.round(result.synthetic_score)}<span>/100</span></div><p className="muted">synthetic likelihood · model score, not a calibrated probability</p>{result.detector && result.mode !== "demo" && <p className="detector-label">{result.detector}</p>}<div className="meter"><i style={{ width: `${Math.max(0, Math.min(100, result.synthetic_score))}%` }} /></div><div className="metrics"><div><small>Risk score</small><strong>{result.risk_score}</strong></div><div><small>Risk level</small><strong>{result.risk_level}</strong></div><div><small>Windows</small><strong>{result.windows_analyzed}</strong></div></div><div className="timeline-graph" aria-label="Live synthetic score timeline">
+          <div className="analyze-layout"><div className="upload-card"><div className="card-title"><FileAudio size={20} /><h3>Voice input</h3></div><p className="muted">WAV, MP3, M4A, or browser WebM. Audio is processed temporarily.</p><label className="dropzone"><Upload size={27} /><strong>Choose a recording</strong><span>Send it to the VOXY pipeline</span><input type="file" accept="audio/*" onChange={(event) => analyzeFile(event.target.files?.[0])} /></label><div className="demo-row"><button onClick={() => chooseDemo("human")}>Human / demo</button><button onClick={() => chooseDemo("synthetic")}>Synthetic / demo</button><button onClick={() => chooseDemo("uncertain")}>Uncertain / demo</button></div><button className="text-action" onClick={() => { if (liveActive) stopLiveSimulation(true); else setCallOpen(!callOpen); }}><Mic size={16} /> {liveActive ? "Stop microphone simulation" : callOpen ? "Close microphone simulation" : "Open microphone simulation"}</button>{callOpen && <div className="inline-note"><strong>Browser Microphone Simulation</strong><p>Audio snapshots are sent to VOXY for live AASIST analysis. It does not intercept cellular calls.</p>{liveActive ? <p className="live-status"><span className="live-dot" /> Listening · {liveSeconds}s</p> : <button className="vxy-pill primary" onClick={startLiveSimulation}>Start microphone analysis</button>}{liveError && <p role="alert">{liveError}</p>}</div>}</div>
+            <div className="result-card" aria-live="polite"><div className="result-top"><div><span className="kicker">Voice assessment</span><h3>{title}</h3></div><span className="badge">{badge}</span></div><div className="score">{liveActive && result.windows_analyzed === 0 ? "—" : Math.round(result.synthetic_score)}<span>/100</span></div><p className="muted">synthetic signal · AASIST margin score; higher means more spoof evidence</p>{result.detector && result.mode !== "demo" && <p className="detector-label">{result.detector}</p>}<div className="meter"><i style={{ width: `${Math.max(0, Math.min(100, result.synthetic_score))}%` }} /></div><div className="metrics"><div><small>Risk score</small><strong>{result.risk_score}</strong></div><div><small>Risk level</small><strong>{result.risk_level}</strong></div><div><small>Windows</small><strong>{result.windows_analyzed}</strong></div></div><div className="timeline-graph" aria-label="Live synthetic score timeline">
               <svg viewBox="0 0 400 130" role="img" aria-label="Synthetic score by analysis window" style={{ width: "100%", height: "170px", display: "block", color: "#c6e93d" }}>
                 <line x1="0" y1="20" x2="400" y2="20" stroke="currentColor" strokeOpacity=".12" />
                 <line x1="0" y1="65" x2="400" y2="65" stroke="currentColor" strokeOpacity=".12" />
@@ -403,11 +479,11 @@ export default function Home() {
                 })()}
               </svg>
             </div>
-            <div className="live-waveform-panel" style={{ marginTop: '10px', borderTop: '1px solid rgba(198,233,61,.12)', paddingTop: '10px' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '7px', fontSize: '10px', letterSpacing: '.12em', textTransform: 'uppercase', color: 'rgba(198,233,61,.78)' }}>
-                <span>Live audio waveform</span><span>{liveActive ? 'MIC INPUT' : 'STANDBY'}</span>
+            <div className="live-waveform-panel" style={{ marginTop: "10px", borderTop: "1px solid rgba(198,233,61,.12)", paddingTop: "10px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "7px", fontSize: "10px", letterSpacing: ".12em", textTransform: "uppercase", color: "rgba(198,233,61,.78)" }}>
+                <span>Live audio waveform</span><span>{liveActive ? "MIC INPUT" : "STANDBY"}</span>
               </div>
-              <canvas ref={waveformCanvas} aria-label="Live microphone waveform" style={{ width: '100%', height: '105px', display: 'block', borderRadius: '10px', background: 'rgba(255,255,255,.018)' }} />
+              <canvas ref={waveformCanvas} aria-label="Live microphone waveform" style={{ width: "100%", height: "105px", display: "block", borderRadius: "10px", background: "rgba(255,255,255,.018)" }} />
             </div>{result.synthetic_score >= 60 && <div className="verify-note"><div className="verify-head"><div><strong>Verification recommended</strong><p>VOXY detected a higher synthetic-voice signal. Confirm the caller before sharing sensitive information.</p></div><span className="verify-score">{Math.round(result.synthetic_score)}/100</span></div><button className="vxy-pill primary verify-button" onClick={() => setVerification(!verification)}>{verification ? <><Check size={15} /> Hide steps</> : "Verify caller"}</button>{verification && <div className="verify-steps"><p><strong>1.</strong> End the call if identity is uncertain.</p><p><strong>2.</strong> Call the person back using a trusted number.</p><p><strong>3.</strong> Never share OTPs, passwords, or payment details from the suspicious call.</p><p><strong>4.</strong> Confirm urgent requests through a second channel.</p></div>}</div>}<p className="model-message">{analysisError || result.model_message}</p></div></div>
         </section>
 

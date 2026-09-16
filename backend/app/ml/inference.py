@@ -23,11 +23,11 @@ class InferenceService:
             if not self.providers:
                 raise RuntimeError("ONNX Runtime has no usable execution provider")
 
-            # Render's free CPU instance is heavily constrained. Keep the ONNX
-            # Runtime session single-threaded so one live inference does not
-            # create a large CPU thread pool and starve the WebSocket worker.
             session_options = ort.SessionOptions()
+            session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            # Render's free instance is CPU-constrained; keep a single worker
+            # thread so multiple inference thread pools do not fight each other.
             session_options.intra_op_num_threads = 1
             session_options.inter_op_num_threads = 1
             self.session = ort.InferenceSession(
@@ -64,9 +64,6 @@ class InferenceService:
         if quality == "insufficient":
             return [], quality, 0
 
-        # Live analysis deliberately uses complete fixed windows. Do not use
-        # split_windows()'s final-tail behavior here because that can create a
-        # nearly duplicate window as soon as one extra sample arrives.
         if len(audio) < TARGET_SAMPLES:
             return [], quality, 0
 
@@ -91,10 +88,7 @@ class InferenceService:
         with torch.inference_mode():
             logits = self.session.run(None, {self.session.get_inputs()[0].name: waveform})[0]
 
-            # The official AASIST training protocol uses label 0 = spoof and
-            # label 1 = bona fide. Therefore class 0 is the synthetic/impersonation
-            # probability and class 1 is bona-fide. Keep this mapping explicit so
-            # a real voice produces a low synthetic score rather than the inverse.
+            # Official AASIST class convention: 0 = spoof, 1 = bona fide.
             logits = np.asarray(logits, dtype=np.float32)
             if logits.shape != (1, 2):
                 raise RuntimeError(f"Unexpected AASIST output shape: {logits.shape}")

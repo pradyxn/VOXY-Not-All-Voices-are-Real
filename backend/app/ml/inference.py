@@ -92,11 +92,14 @@ class InferenceService:
             logits = np.asarray(logits, dtype=np.float32)
             if logits.shape != (1, 2):
                 raise RuntimeError(f"Unexpected AASIST output shape: {logits.shape}")
-            shifted = logits[0] - float(np.max(logits[0]))
-            probabilities = np.exp(shifted) / np.sum(np.exp(shifted))
-            spoof_score = float(probabilities[0] * 100.0)
             bona_fide_logit = float(logits[0, 1])
             spoof_logit = float(logits[0, 0])
+
+            # Official AASIST wrapper: logits[:, 1] is bona fide, and higher
+            # bona-fide evidence means lower synthetic likelihood. Use the
+            # monotonic transform of that score for VOXY's 0-100 scale.
+            synthetic_probability = 1.0 / (1.0 + np.exp(np.clip(bona_fide_logit, -60.0, 60.0)))
+            spoof_score = float(synthetic_probability * 100.0)
 
         return bona_fide_logit, spoof_logit, round(spoof_score, 1)
 

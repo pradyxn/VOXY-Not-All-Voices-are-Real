@@ -9,7 +9,7 @@
   "window_hop_samples": 32300,
   "input": "raw float32 mono waveform",
   "checkpoint": "https://huggingface.co/SpeechAntiSpoofingBenchmarks/AASIST/resolve/main/aasist.onnx",
-  "score_direction": "VOXY computes sigmoid(spoof_logit - bonafide_logit) * 100, so higher means more spoof/synthetic signal",
+  "score_direction": "VOXY synthetic score is sigmoid(-bonafide_logit) * 100; higher means more synthetic/spoof signal",
   "pretrained": true,
   "smoke_test": false
 }

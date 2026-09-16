@@ -314,6 +314,15 @@ export default function Home() {
         .vxy-shell.theme-dark .vxy-footer{border-color:rgba(255,255,255,.12)}
         .vxy-shell.theme-dark .contact-email{color:#f2f4ee}
         .theme-toggle{white-space:nowrap}
+        .vxy-shell.theme-light,.vxy-shell.theme-dark{font-family:'Inter',sans-serif}
+        .vxy-shell.theme-light h1,.vxy-shell.theme-light h2,.vxy-shell.theme-light h3,.vxy-shell.theme-light h4,.vxy-shell.theme-light .vxy-title,.vxy-shell.theme-dark h1,.vxy-shell.theme-dark h2,.vxy-shell.theme-dark h3,.vxy-shell.theme-dark h4,.vxy-shell.theme-dark .vxy-title{font-family:'Bricolage Grotesque',sans-serif}
+        .vxy-shell.theme-light button,.vxy-shell.theme-light input,.vxy-shell.theme-light textarea,.vxy-shell.theme-dark button,.vxy-shell.theme-dark input,.vxy-shell.theme-dark textarea{font-family:'Inter',sans-serif}
+        .verify-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+        .verify-head p{margin:5px 0 0}
+        .verify-score{font-weight:800;white-space:nowrap}
+        .verify-button{margin-top:10px}
+        .verify-steps{margin-top:12px;display:grid;gap:7px}
+        .verify-steps p{margin:0}
         .vxy-shell .vxy-nav-links button,.vxy-shell .vxy-pill,.vxy-shell .theme-toggle,.vxy-shell .vxy-logo,.vxy-shell .demo-row button,.vxy-shell .text-action,.vxy-shell .contact-email{transition:transform .2s ease,color .2s ease,background .2s ease,border-color .2s ease}
         @media (hover:hover) and (pointer:fine){
           .vxy-shell .vxy-nav-links button:hover,.vxy-shell .text-action:hover,.vxy-shell .contact-email:hover{transform:scale(1.035) translateY(-1px)}
@@ -399,7 +408,7 @@ export default function Home() {
                 <span>Live audio waveform</span><span>{liveActive ? 'MIC INPUT' : 'STANDBY'}</span>
               </div>
               <canvas ref={waveformCanvas} aria-label="Live microphone waveform" style={{ width: '100%', height: '105px', display: 'block', borderRadius: '10px', background: 'rgba(255,255,255,.018)' }} />
-            </div>{result.risk_score >= 60 && <div className="verify-note"><strong>Verify before taking action.</strong><p>Ask a trusted question, contact the person through another channel, and do not share OTPs or transfer money based on the call alone.</p><button className="vxy-pill primary" onClick={() => setVerification(!verification)}>{verification ? <><Check size={15} /> Steps shown</> : "Verify caller"}</button>{verification && <p><Check size={15} /> End the call, use a trusted contact method, and independently confirm identity.</p>}</div>}<p className="model-message">{analysisError || result.model_message}</p></div></div>
+            </div>{result.synthetic_score >= 60 && <div className="verify-note"><div className="verify-head"><div><strong>Verification recommended</strong><p>VOXY detected a higher synthetic-voice signal. Confirm the caller before sharing sensitive information.</p></div><span className="verify-score">{Math.round(result.synthetic_score)}/100</span></div><button className="vxy-pill primary verify-button" onClick={() => setVerification(!verification)}>{verification ? <><Check size={15} /> Hide steps</> : "Verify caller"}</button>{verification && <div className="verify-steps"><p><strong>1.</strong> End the call if identity is uncertain.</p><p><strong>2.</strong> Call the person back using a trusted number.</p><p><strong>3.</strong> Never share OTPs, passwords, or payment details from the suspicious call.</p><p><strong>4.</strong> Confirm urgent requests through a second channel.</p></div>}</div>}<p className="model-message">{analysisError || result.model_message}</p></div></div>
         </section>
 
         <section className="vxy-section split-section reveal" id="insights"><div><span className="kicker">HOW VOXY WORKS</span><h2>From voice<br />to risk signal.</h2></div><p>Audio enters VOXY as a short voice sample. We normalize it to 16 kHz, split it into overlapping 4-second windows, and analyze each raw waveform with the pretrained AASIST anti-spoofing model. Results are aggregated across the recording to produce a 0–100 spoof-risk score.</p></section>

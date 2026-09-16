@@ -96,7 +96,16 @@ export default function Home() {
       const body = new FormData();
       body.append("audio", file);
       const response = await fetch(`${API}/api/analyze`, { method: "POST", body });
-      if (!response.ok) throw new Error("Backend unavailable");
+      if (!response.ok) {
+        let message = `Audio analysis failed (${response.status}).`;
+        try {
+          const payload = await response.json() as { detail?: string };
+          if (payload.detail) message = payload.detail;
+        } catch {
+          // Keep the status-based message when the server response is not JSON.
+        }
+        throw new Error(message);
+      }
       setResult(await response.json());
     } catch (error) {
       setAnalysisError(error instanceof Error ? error.message : "Audio analysis failed.");

@@ -38,12 +38,22 @@ function scrollToSection(id: string) {
 
 export default function Home() {
   const [result, setResult] = useState<Result>(demoResults.uncertain);
+  const [theme, setTheme] = useState<"light" | "dark">("light");
   const [busy, setBusy] = useState(false);
   const [modal, setModal] = useState<"login" | "contact" | null>(null);
   const [callOpen, setCallOpen] = useState(false);
   const [verification, setVerification] = useState(false);
   const [activeStep, setActiveStep] = useState(0);
-  const [theme, setTheme] = useState<"light" | "dark">("light");
+
+  useEffect(() => {
+    const savedTheme = window.localStorage.getItem("voxy-theme");
+    if (savedTheme === "dark" || savedTheme === "light") setTheme(savedTheme);
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem("voxy-theme", theme);
+  }, [theme]);
 
   useEffect(() => {
     const items = document.querySelectorAll(".reveal");
@@ -125,7 +135,7 @@ export default function Home() {
               <button onClick={() => setModal("contact")}>Contact</button>
             </div>
             <div className="vxy-nav-actions">
-              <button className="theme-toggle" onClick={() => setTheme(theme === "light" ? "dark" : "light")} aria-label={`Switch to ${theme === "light" ? "dark" : "light"} theme`} aria-pressed={theme === "dark"}>
+              <button className="theme-toggle" type="button" onClick={() => setTheme(theme === "light" ? "dark" : "light")} aria-label={`Switch to ${theme === "light" ? "dark" : "light"} mode`} aria-pressed={theme === "dark"} title={`Switch to ${theme === "light" ? "dark" : "light"} mode`}>
                 {theme === "light" ? <Moon size={16} /> : <Sun size={16} />}
                 <span>{theme === "light" ? "Dark" : "Light"}</span>
               </button>

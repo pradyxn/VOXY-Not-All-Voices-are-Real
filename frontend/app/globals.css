@@ -1051,6 +1051,176 @@ img {
   }
 }
 
+/* Theme control and the shared dark-mode surface tokens. */
+:root {
+  --theme-surface: #f8f8f4;
+  --theme-surface-alt: #eaebe7;
+  --theme-card: #f5f6f1;
+  --theme-shadow: rgba(27, 30, 31, 0.08);
+}
+
+[data-theme="dark"] {
+  --bg-panel: #080b0a;
+  --frame: #111615;
+  --ink: #f3f5ef;
+  --muted: #aab4ae;
+  --pill: #202724;
+  --line: rgba(243, 245, 239, 0.18);
+  --theme-surface: #111615;
+  --theme-surface-alt: #171d1a;
+  --theme-card: #202724;
+  --theme-shadow: rgba(0, 0, 0, 0.35);
+}
+
+body,
+.vxy-shell,
+.vxy-frame,
+.vxy-nav,
+.vxy-section,
+.analyze-section,
+.upload-card,
+.modal {
+  transition: background-color 0.35s ease, color 0.35s ease, border-color 0.35s ease, box-shadow 0.35s ease;
+}
+
+.vxy-frame {
+  background: var(--theme-surface);
+  box-shadow: 0 24px 60px var(--theme-shadow);
+}
+
+.vxy-shell {
+  background: var(--bg-panel);
+}
+
+.vxy-nav {
+  border-color: var(--line);
+  background: color-mix(in srgb, var(--theme-surface) 72%, transparent);
+}
+
+.vxy-nav-links button,
+.vxy-nav-links a,
+.hero-meta,
+.vxy-copy-wrap p,
+.vxy-stat,
+.vxy-footer,
+.vxy-eyebrow,
+.kicker {
+  color: color-mix(in srgb, var(--ink) 68%, transparent);
+}
+
+.vxy-title,
+.hero-meta-left strong,
+.hero-meta-right p,
+.pipeline-step,
+.demo-row button,
+.text-action,
+.dropzone strong,
+.dropzone span,
+.modal-close,
+.modal h2,
+.contact-email {
+  color: var(--ink);
+}
+
+.analyze-section {
+  background: var(--theme-surface-alt);
+}
+
+.upload-card {
+  background: var(--theme-card);
+  border-color: var(--line);
+}
+
+.pipeline-step,
+.demo-row button {
+  border-color: var(--line);
+}
+
+.modal {
+  background: var(--theme-card);
+}
+
+.theme-toggle {
+  width: 54px;
+  height: 32px;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--pill);
+  color: var(--ink);
+  transition: transform 0.2s ease, background-color 0.35s ease, border-color 0.35s ease;
+}
+
+.theme-toggle:hover {
+  transform: translateY(-1px);
+}
+
+.theme-toggle:focus-visible {
+  outline: 3px solid var(--lime);
+  outline-offset: 3px;
+}
+
+.theme-toggle-track {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  height: 100%;
+  padding: 0 7px;
+}
+
+.theme-icon {
+  position: relative;
+  z-index: 1;
+  transition: color 0.25s ease, opacity 0.25s ease;
+}
+
+.sun-icon {
+  color: #a57912;
+}
+
+.moon-icon {
+  color: #8ca5c5;
+  opacity: 0.58;
+}
+
+.theme-toggle-thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--lime);
+  box-shadow: 0 2px 7px rgba(0, 0, 0, 0.2);
+  transition: transform 0.3s ease, background-color 0.35s ease;
+}
+
+[data-theme="dark"] .theme-toggle-thumb {
+  transform: translateX(22px);
+}
+
+[data-theme="dark"] .sun-icon {
+  opacity: 0.58;
+}
+
+[data-theme="dark"] .moon-icon {
+  opacity: 1;
+}
+
+@media (max-width: 760px) {
+  .theme-toggle {
+    width: 50px;
+    height: 30px;
+  }
+
+  [data-theme="dark"] .theme-toggle-thumb {
+    transform: translateX(20px);
+  }
+}
+
 /* VOXY editorial product composition */
 .vxy-shell {
   padding: 30px clamp(14px, 4vw, 58px);
@@ -1983,4 +2153,50 @@ img {
   .contact-email:hover {
     transform: none;
   }
+}
+
+[data-theme="dark"] .vxy-frame {
+  background: var(--theme-surface);
+  border-color: var(--line);
+}
+
+[data-theme="dark"] .vxy-nav {
+  border-color: var(--line);
+  background: rgba(17, 22, 21, 0.72);
+}
+
+[data-theme="dark"] .vxy-title,
+[data-theme="dark"] .vxy-logo,
+[data-theme="dark"] .vxy-nav-links button:hover {
+  color: var(--ink);
+}
+
+[data-theme="dark"] .vxy-eyebrow,
+[data-theme="dark"] .hero-meta,
+[data-theme="dark"] .hero-meta-left .meta-label,
+[data-theme="dark"] .hero-meta-right p,
+[data-theme="dark"] .hero-meta-left strong,
+[data-theme="dark"] .vxy-footer {
+  color: color-mix(in srgb, var(--ink) 68%, transparent);
+}
+
+[data-theme="dark"] .vxy-section:not(.dark),
+[data-theme="dark"] .analyze-section {
+  background: var(--theme-surface-alt);
+  border-color: var(--line);
+}
+
+[data-theme="dark"] .upload-card {
+  background: var(--theme-card);
+  border-color: var(--line);
+}
+
+[data-theme="dark"] .pipeline-step,
+[data-theme="dark"] .demo-row button {
+  color: var(--ink);
+  border-color: var(--line);
+}
+
+[data-theme="dark"] .modal {
+  background: var(--theme-card);
 }

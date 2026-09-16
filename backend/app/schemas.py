@@ -3,6 +3,7 @@ from typing import Literal
 
 RiskLevel = Literal["LOW", "MODERATE", "HIGH", "CRITICAL"]
 
+
 class AnalysisResponse(BaseModel):
     status: str
     synthetic_score: float = Field(ge=0, le=100)
@@ -13,7 +14,8 @@ class AnalysisResponse(BaseModel):
     mode: Literal["pretrained", "demo"]
     detector: str = "AASIST pretrained anti-spoofing model"
     model_message: str | None = None
-    timeline: list[float] = []
+    timeline: list[float] = Field(default_factory=list)
+
 
 class HealthResponse(BaseModel):
     status: str

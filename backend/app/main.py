@@ -31,8 +31,6 @@ async def lifespan(_: FastAPI):
     yield
 
 
-# IMPORTANT: register the lifespan handler so the AASIST service is actually
-# constructed before /api/health and /ws/analyze are used.
 app = FastAPI(title="VOXY API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
@@ -85,7 +83,7 @@ async def analyze(audio: UploadFile = File(...)) -> AnalysisResponse:
             audio_quality=quality,
             mode=service.mode,
             detector=service.detector,
-            model_message="AASIST score converted from bona-fide-vs-spoof logits; not a calibrated probability.",
+            model_message="AASIST spoof probability derived from the official 2-class output; higher means more synthetic/spoof signal.",
             timeline=timeline,
         )
     except Exception as error:
@@ -108,6 +106,7 @@ async def analyze_stream(websocket: WebSocket) -> None:
     await websocket.accept()
 
     if service is None or not service.loaded:
+        await websocket.send_json({"error": "AASIST detector is unavailable"})
         await websocket.close(code=1011, reason="AASIST detector is unavailable")
         return
 
@@ -143,24 +142,29 @@ async def analyze_stream(websocket: WebSocket) -> None:
                     print("VOXY live: segment contained insufficient usable audio")
                     continue
 
-                score = float(timeline[0])
+                # One complete four-second microphone segment is one fresh model
+                # decision. Keep the history for the graph/stability metric, but
+                # expose the CURRENT model score as synthetic_score so the 0-100
+                # display follows the voice being heard instead of being damped by
+                # an old median that can stay near the demo value for too long.
+                score = float(timeline[-1])
                 scores.append(score)
                 scores = scores[-MAX_WINDOWS:]
                 window_id += 1
 
-                aggregate, stability, windows = aggregate_scores(scores)
-                risk, level = calculate_risk(aggregate, windows, stability, quality)
+                _aggregate, stability, windows = aggregate_scores(scores)
+                risk, level = calculate_risk(score, windows, stability, quality)
 
                 payload = {
                     "window_id": window_id,
-                    "synthetic_score": aggregate,
+                    "synthetic_score": round(score, 1),
                     "risk_score": risk,
                     "risk_level": level,
                     "status": (
                         "suspicious"
-                        if aggregate >= 60
+                        if score >= 60
                         else "human"
-                        if aggregate < 35
+                        if score < 35
                         else "uncertain"
                     ),
                     "stability": stability,
@@ -174,12 +178,13 @@ async def analyze_stream(websocket: WebSocket) -> None:
                 await websocket.send_json(payload)
                 print(
                     f"VOXY live: window={window_id} "
-                    f"score={score:.1f} aggregate={aggregate:.1f} "
-                    f"risk={risk} level={level}"
+                    f"score={score:.1f} risk={risk} level={level}"
                 )
 
             except Exception as error:
                 print(f"VOXY live segment error: {error}")
+                # Keep the WebSocket alive when one microphone segment is bad.
+                # The next complete segment can still be analyzed normally.
                 continue
             finally:
                 if temporary_path:

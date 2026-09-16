@@ -2,7 +2,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from .preprocessing import load_audio, quality_check, split_windows
-from ..config import MAX_WINDOWS, MODEL_PATH, SAMPLE_RATE, TARGET_SAMPLES
+from ..config import MAX_WINDOWS, MODEL_PATH, SAMPLE_RATE, TARGET_SAMPLES, WINDOW_HOP_SAMPLES
 
 class InferenceService:
     def __init__(self) -> None:
@@ -21,7 +21,19 @@ class InferenceService:
             self.providers = [provider for provider in preferred if provider in available]
             if not self.providers:
                 raise RuntimeError("ONNX Runtime has no usable execution provider")
-            self.session = ort.InferenceSession(str(MODEL_PATH), providers=self.providers)
+
+            # Render's free CPU instance is heavily constrained. Keep the ONNX
+            # Runtime session single-threaded so one live inference does not
+            # create a large CPU thread pool and starve the WebSocket worker.
+            session_options = ort.SessionOptions()
+            session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            session_options.intra_op_num_threads = 1
+            session_options.inter_op_num_threads = 1
+            self.session = ort.InferenceSession(
+                str(MODEL_PATH),
+                sess_options=session_options,
+                providers=self.providers,
+            )
             input_shape = self.session.get_inputs()[0].shape
             if input_shape[-1] != TARGET_SAMPLES:
                 raise RuntimeError(f"Unexpected AASIST input shape: {input_shape}")
@@ -39,6 +51,32 @@ class InferenceService:
             return [], quality
         windows = split_windows(audio)[:MAX_WINDOWS]
         return [self.predict_window(window) for window in windows], quality
+
+    def predict_new_file_windows(
+        self,
+        path: str | Path,
+        start_index: int,
+    ) -> tuple[list[float], str, int]:
+        """Decode the live recording once, but infer only windows not seen before."""
+        audio, _ = load_audio(path)
+        quality = quality_check(audio)
+        if quality == "insufficient":
+            return [], quality, 0
+
+        # Live analysis deliberately uses complete fixed windows. Do not use
+        # split_windows()'s final-tail behavior here because that can create a
+        # nearly duplicate window as soon as one extra sample arrives.
+        if len(audio) < TARGET_SAMPLES:
+            return [], quality, 0
+
+        available = 1 + (len(audio) - TARGET_SAMPLES) // WINDOW_HOP_SAMPLES
+        available = min(available, MAX_WINDOWS)
+        if available <= start_index:
+            return [], quality, available
+
+        windows = split_windows(audio)[:available]
+        new_windows = windows[start_index:available]
+        return [self.predict_window(window) for window in new_windows], quality, available
 
     def predict_window(self, audio: np.ndarray) -> float:
         _, _, spoof_score = self.predict_window_details(audio)

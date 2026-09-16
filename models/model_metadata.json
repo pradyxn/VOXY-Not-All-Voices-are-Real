@@ -1,15 +1,15 @@
 {
   "model_architecture": "AASIST",
   "class_mapping": {
-    "bonafide_logit": 0,
-    "spoof_logit": 1
+    "spoof_logit": 0,
+    "bonafide_logit": 1
   },
   "sample_rate": 16000,
   "target_samples": 64600,
   "window_hop_samples": 32300,
   "input": "raw float32 mono waveform",
   "checkpoint": "https://huggingface.co/SpeechAntiSpoofingBenchmarks/AASIST/resolve/main/aasist.onnx",
-  "score_direction": "AASIST logits favor bona fide at logit 0; VOXY uses sigmoid(spoof_logit - bonafide_logit) * 100",
+  "score_direction": "VOXY computes sigmoid(spoof_logit - bonafide_logit) * 100, so higher means more spoof/synthetic signal",
   "pretrained": true,
   "smoke_test": false
 }

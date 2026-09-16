@@ -17,7 +17,7 @@ type Result = {
   risk_level: string;
   windows_analyzed: number;
   audio_quality: string;
-  mode: string;
+  mode: "pretrained" | "demo" | "live";
   detector?: string;
   model_message?: string;
   timeline: number[];
@@ -27,6 +27,18 @@ const demoResults: Record<string, Result> = {
   human: { status: "human", synthetic_score: 18, risk_score: 12, risk_level: "LOW", windows_analyzed: 4, audio_quality: "good", mode: "demo", model_message: "SIMULATION - deterministic demo output", timeline: [14, 21, 16, 18] },
   synthetic: { status: "suspicious", synthetic_score: 91, risk_score: 88, risk_level: "CRITICAL", windows_analyzed: 4, audio_quality: "good", mode: "demo", model_message: "SIMULATION - deterministic demo output", timeline: [84, 93, 89, 96] },
   uncertain: { status: "uncertain", synthetic_score: 52, risk_score: 43, risk_level: "MODERATE", windows_analyzed: 3, audio_quality: "good", mode: "demo", model_message: "SIMULATION - deterministic demo output", timeline: [45, 59, 51] },
+};
+
+const liveListeningResult: Result = {
+  status: "uncertain",
+  synthetic_score: 0,
+  risk_score: 0,
+  risk_level: "LOW",
+  windows_analyzed: 0,
+  audio_quality: "waiting",
+  mode: "live",
+  model_message: "LISTENING - waiting for the first complete voice window...",
+  timeline: [],
 };
 
 const pipelineSteps = [
@@ -123,6 +135,7 @@ export default function Home() {
   }
 
   function chooseDemo(kind: keyof typeof demoResults) {
+    stopLiveSimulation(true);
     setAnalysisError(null);
     setResult(demoResults[kind]);
     scrollToSection("analyze");
@@ -144,6 +157,7 @@ export default function Home() {
   async function startLiveSimulation() {
     setLiveError(null);
     setAnalysisError(null);
+    setResult(liveListeningResult);
     if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
       setLiveError("This browser does not support microphone recording.");
       return;
@@ -217,12 +231,16 @@ export default function Home() {
       liveSocket.onmessage = (event) => {
         try {
           if (typeof event.data !== "string") return;
-          const update = JSON.parse(event.data) as Result;
+          const update = JSON.parse(event.data) as Result & { error?: string };
           logWebSocket("onmessage", update);
+          if (update.error) {
+            setLiveError(update.error);
+            return;
+          }
           setResult({
             ...update,
             mode: "pretrained",
-            model_message: "LIVE MODEL ANALYSIS - AASIST pretrained anti-spoofing model",
+            model_message: "LIVE MODEL ANALYSIS - AASIST pretrained anti-spoofing model · current voice window",
           });
         } catch (error) {
           logWebSocket("invalid server message", error);
@@ -263,7 +281,23 @@ export default function Home() {
     }
   }
 
-  const title = busy ? "Analyzing..." : result.status === "suspicious" ? "Elevated signal" : result.status === "human" ? "Lower signal" : "Needs context";
+  const title = busy
+    ? "Analyzing..."
+    : liveActive && result.windows_analyzed === 0
+      ? "Listening..."
+      : result.status === "suspicious"
+        ? "Elevated signal"
+        : result.status === "human"
+          ? "Lower signal"
+          : "Needs context";
+
+  const badge = liveActive
+    ? result.windows_analyzed === 0
+      ? "LISTENING"
+      : "LIVE"
+    : result.mode === "demo"
+      ? "SIMULATION"
+      : result.risk_level;
 
   return (
     <main className={`vxy-shell theme-${theme}`}>
@@ -340,7 +374,7 @@ export default function Home() {
         <section className="vxy-section analyze-section reveal" id="analyze">
           <div className="section-heading"><div><span className="kicker">Live workspace</span><h2>Analyze a voice.</h2></div><p>Upload an audio clip or choose a labelled simulation. Demo values are never presented as genuine model predictions.</p></div>
           <div className="analyze-layout"><div className="upload-card"><div className="card-title"><FileAudio size={20} /><h3>Voice input</h3></div><p className="muted">WAV, MP3, M4A, or browser WebM. Audio is processed temporarily.</p><label className="dropzone"><Upload size={27} /><strong>Choose a recording</strong><span>Send it to the VOXY pipeline</span><input type="file" accept="audio/*" onChange={(event) => analyzeFile(event.target.files?.[0])} /></label><div className="demo-row"><button onClick={() => chooseDemo("human")}>Human / demo</button><button onClick={() => chooseDemo("synthetic")}>Synthetic / demo</button><button onClick={() => chooseDemo("uncertain")}>Uncertain / demo</button></div><button className="text-action" onClick={() => { if (liveActive) stopLiveSimulation(true); else setCallOpen(!callOpen); }}><Mic size={16} /> {liveActive ? "Stop microphone simulation" : callOpen ? "Close microphone simulation" : "Open microphone simulation"}</button>{callOpen && <div className="inline-note"><strong>Browser Microphone Simulation</strong><p>Audio is streamed to VOXY for live AASIST analysis. It does not intercept cellular calls.</p>{liveActive ? <p className="live-status"><span className="live-dot" /> Listening · {liveSeconds}s</p> : <button className="vxy-pill primary" onClick={startLiveSimulation}>Start microphone analysis</button>}{liveError && <p role="alert">{liveError}</p>}</div>}</div>
-            <div className="result-card" aria-live="polite"><div className="result-top"><div><span className="kicker">Voice assessment</span><h3>{title}</h3></div><span className="badge">{result.mode === "demo" ? "SIMULATION" : result.risk_level}</span></div><div className="score">{Math.round(result.synthetic_score)}<span>/100</span></div><p className="muted">synthetic likelihood · model score, not a calibrated probability</p>{result.detector && result.mode !== "demo" && <p className="detector-label">{result.detector}</p>}<div className="meter"><i style={{ width: `${result.synthetic_score}%` }} /></div><div className="metrics"><div><small>Risk score</small><strong>{result.risk_score}</strong></div><div><small>Risk level</small><strong>{result.risk_level}</strong></div><div><small>Windows</small><strong>{result.windows_analyzed}</strong></div></div><div className="timeline-graph" aria-label="Live synthetic score timeline">
+            <div className="result-card" aria-live="polite"><div className="result-top"><div><span className="kicker">Voice assessment</span><h3>{title}</h3></div><span className="badge">{badge}</span></div><div className="score">{Math.round(result.synthetic_score)}<span>/100</span></div><p className="muted">synthetic likelihood · model score, not a calibrated probability</p>{result.detector && result.mode !== "demo" && <p className="detector-label">{result.detector}</p>}<div className="meter"><i style={{ width: `${Math.max(0, Math.min(100, result.synthetic_score))}%` }} /></div><div className="metrics"><div><small>Risk score</small><strong>{result.risk_score}</strong></div><div><small>Risk level</small><strong>{result.risk_level}</strong></div><div><small>Windows</small><strong>{result.windows_analyzed}</strong></div></div><div className="timeline-graph" aria-label="Live synthetic score timeline">
               <svg viewBox="0 0 400 130" role="img" aria-label="Synthetic score by analysis window" style={{ width: "100%", height: "170px", display: "block", color: "#c6e93d" }}>
                 <line x1="0" y1="20" x2="400" y2="20" stroke="currentColor" strokeOpacity=".12" />
                 <line x1="0" y1="65" x2="400" y2="65" stroke="currentColor" strokeOpacity=".12" />

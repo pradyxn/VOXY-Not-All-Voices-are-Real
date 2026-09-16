@@ -129,7 +129,7 @@ async def analyze_stream(websocket: WebSocket) -> None:
 
             temporary_path: str | None = None
             try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temporary:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temporary:
                     temporary.write(chunk)
                     temporary_path = temporary.name
 

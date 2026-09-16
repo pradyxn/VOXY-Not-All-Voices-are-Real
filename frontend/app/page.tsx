@@ -54,6 +54,42 @@ function scrollToSection(id: string) {
   document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
+const LIVE_SAMPLE_RATE = 16000;
+const LIVE_WINDOW_SECONDS = 4.0375;
+const LIVE_TARGET_SAMPLES = 64600;
+
+function downsampleToTarget(input: Float32Array): Float32Array {
+  const output = new Float32Array(LIVE_TARGET_SAMPLES);
+  if (!input.length) return output;
+  const ratio = input.length / LIVE_TARGET_SAMPLES;
+  for (let index = 0; index < LIVE_TARGET_SAMPLES; index += 1) {
+    const position = index * ratio;
+    const left = Math.min(Math.floor(position), input.length - 1);
+    const right = Math.min(left + 1, input.length - 1);
+    const fraction = position - left;
+    output[index] = input[left] + (input[right] - input[left]) * fraction;
+  }
+  return output;
+}
+
+function encodeWav(samples: Float32Array, sampleRate: number): ArrayBuffer {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const write = (offset: number, value: string) => {
+    for (let index = 0; index < value.length; index += 1) view.setUint8(offset + index, value.charCodeAt(index));
+  };
+  write(0, 'RIFF'); write(8, 'WAVE'); write(12, 'fmt '); write(36, 'data');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true); view.setUint32(40, samples.length * 2, true);
+  for (let index = 0; index < samples.length; index += 1) {
+    const sample = Math.max(-1, Math.min(1, samples[index]));
+    view.setInt16(44 + index * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+  }
+  return buffer;
+}
+
 export default function Home() {
   const [result, setResult] = useState<Result>(demoResults.uncertain);
   const [theme, setTheme] = useState<"light" | "dark">("light");
@@ -70,6 +106,17 @@ export default function Home() {
   const intentionalStop = useRef(false);
   const stopSegments = useRef<(() => void) | null>(null);
   const [verification, setVerification] = useState(false);
+  const audioContext = useRef<AudioContext | null>(null);
+  const audioSource = useRef<MediaStreamAudioSourceNode | null>(null);
+  const analyser = useRef<AnalyserNode | null>(null);
+  const pcmProcessor = useRef<ScriptProcessorNode | null>(null);
+  const silentGain = useRef<GainNode | null>(null);
+  const waveformCanvas = useRef<HTMLCanvasElement | null>(null);
+  const waveformFrame = useRef<number | null>(null);
+  const snapshotTimer = useRef<number | null>(null);
+  const pcmChunks = useRef<Float32Array[]>([]);
+  const pcmSampleCount = useRef(0);
+  const modelRequestPending = useRef(false);
   const [activeStep, setActiveStep] = useState(0);
 
   useEffect(() => {
@@ -143,140 +190,88 @@ export default function Home() {
 
   function stopLiveSimulation(silent = false) {
     intentionalStop.current = silent;
-    stopSegments.current?.();
-    stopSegments.current = null;
-    if (mediaRecorder.current && mediaRecorder.current.state !== "inactive") mediaRecorder.current.stop();
+    if (snapshotTimer.current !== null) { window.clearInterval(snapshotTimer.current); snapshotTimer.current = null; }
+    if (waveformFrame.current !== null) { window.cancelAnimationFrame(waveformFrame.current); waveformFrame.current = null; }
+    if (pcmProcessor.current) { pcmProcessor.current.onaudioprocess = null; try { pcmProcessor.current.disconnect(); } catch {} pcmProcessor.current = null; }
+    try { silentGain.current?.disconnect(); } catch {}
+    try { audioSource.current?.disconnect(); } catch {}
+    audioSource.current = null; analyser.current = null; silentGain.current = null;
+    if (audioContext.current && audioContext.current.state !== 'closed') void audioContext.current.close();
+    audioContext.current = null; pcmChunks.current = []; pcmSampleCount.current = 0; modelRequestPending.current = false;
     mediaStream.current?.getTracks().forEach((track) => track.stop());
-    socket.current?.close(1000, "client stopped");
-    mediaRecorder.current = null;
-    mediaStream.current = null;
-    socket.current = null;
-    setLiveActive(false);
+    socket.current?.close(1000, 'client stopped');
+    mediaStream.current = null; socket.current = null; setLiveActive(false);
   }
 
   async function startLiveSimulation() {
-    setLiveError(null);
-    setAnalysisError(null);
-    setResult(liveListeningResult);
-    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
-      setLiveError("This browser does not support microphone recording.");
-      return;
-    }
-
+    setLiveError(null); setAnalysisError(null); setResult(liveListeningResult);
+    pcmChunks.current = []; pcmSampleCount.current = 0; modelRequestPending.current = false;
+    if (!navigator.mediaDevices?.getUserMedia || !window.AudioContext) { setLiveError('This browser does not support live microphone analysis.'); return; }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus"
-        : "";
-      const webSocketUrl = getWebSocketUrl(API, window.location.protocol);
-      logWebSocket("attempting connection", webSocketUrl);
-      const liveSocket = new WebSocket(webSocketUrl);
+      const liveSocket = new WebSocket(getWebSocketUrl(API, window.location.protocol));
+      const context = new AudioContext(); await context.resume();
+      const source = context.createMediaStreamSource(stream);
+      const analyserNode = context.createAnalyser(); analyserNode.fftSize = 2048; analyserNode.smoothingTimeConstant = 0.12;
+      const processor = context.createScriptProcessor(4096, 1, 1); const silent = context.createGain(); silent.gain.value = 0;
+      source.connect(analyserNode); source.connect(processor); processor.connect(silent); silent.connect(context.destination);
+      mediaStream.current = stream; socket.current = liveSocket; audioContext.current = context; audioSource.current = source; analyser.current = analyserNode; pcmProcessor.current = processor; silentGain.current = silent; intentionalStop.current = false;
 
-      mediaStream.current = stream;
-      socket.current = liveSocket;
-      intentionalStop.current = false;
-
-      liveSocket.onopen = () => {
-        logWebSocket("onopen");
-        setLiveSeconds(0);
-        setLiveActive(true);
-
-        // Send complete, independently decodable WebM segments. Sending
-        // MediaRecorder timeslice fragments caused incomplete WebM containers
-        // to reach the backend and fail during decoding.
-        let segmentRecorder: MediaRecorder | null = null;
-        let stopped = false;
-
-        const recordSegment = () => {
-          if (stopped || liveSocket.readyState !== WebSocket.OPEN) return;
-
-          const chunks: Blob[] = [];
-          const nextRecorder = mimeType
-            ? new MediaRecorder(stream, { mimeType })
-            : new MediaRecorder(stream);
-          segmentRecorder = nextRecorder;
-
-          nextRecorder.ondataavailable = (event) => {
-            if (event.data.size > 0) chunks.push(event.data);
-          };
-
-          nextRecorder.onerror = () => {
-            setLiveError("Microphone recording stopped unexpectedly.");
-          };
-
-          nextRecorder.onstop = () => {
-            if (stopped) return;
-            const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
-            if (blob.size > 0 && liveSocket.readyState === WebSocket.OPEN) {
-              logWebSocket("sending complete segment", { bytes: blob.size });
-              liveSocket.send(blob);
-            }
-            window.setTimeout(recordSegment, 25);
-          };
-
-          nextRecorder.start();
-          window.setTimeout(() => {
-            if (nextRecorder.state === "recording") nextRecorder.stop();
-          }, 4000);
-        };
-
-        stopSegments.current = () => {
-          stopped = true;
-          if (segmentRecorder && segmentRecorder.state !== "inactive") segmentRecorder.stop();
-        };
-
-        recordSegment();
+      const drawWaveform = () => {
+        const canvas = waveformCanvas.current; const current = analyser.current;
+        if (!canvas || !current) return;
+        const dpr = window.devicePixelRatio || 1; const width = Math.max(1, Math.floor(canvas.clientWidth * dpr)); const height = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+        if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
+        const ctx = canvas.getContext('2d'); if (!ctx) return;
+        const data = new Uint8Array(current.fftSize); current.getByteTimeDomainData(data); ctx.clearRect(0, 0, width, height);
+        ctx.strokeStyle = 'rgba(198,233,61,.95)'; ctx.lineWidth = Math.max(1.5, dpr * 1.5); ctx.beginPath();
+        const dx = width / data.length;
+        for (let index = 0; index < data.length; index += 1) { const x = index * dx; const y = height / 2 + ((data[index] - 128) / 128) * height * 0.42; if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); }
+        ctx.stroke(); waveformFrame.current = window.requestAnimationFrame(drawWaveform);
       };
 
+      processor.onaudioprocess = (event) => {
+        const copy = new Float32Array(event.inputBuffer.getChannelData(0)); pcmChunks.current.push(copy); pcmSampleCount.current += copy.length;
+        const keep = Math.ceil(context.sampleRate * (LIVE_WINDOW_SECONDS + 0.5));
+        while (pcmChunks.current.length > 1 && pcmSampleCount.current > keep) { const removed = pcmChunks.current.shift(); if (removed) pcmSampleCount.current -= removed.length; }
+      };
+
+      const buildWindow = () => {
+        const needed = Math.ceil(context.sampleRate * LIVE_WINDOW_SECONDS); if (pcmSampleCount.current < needed) return null;
+        const joined = new Float32Array(pcmSampleCount.current); let offset = 0; for (const chunk of pcmChunks.current) { joined.set(chunk, offset); offset += chunk.length; }
+        return downsampleToTarget(joined.subarray(Math.max(0, joined.length - needed)));
+      };
+      const sendWindow = () => {
+        if (liveSocket.readyState !== WebSocket.OPEN || modelRequestPending.current) return;
+        const samples = buildWindow(); if (!samples) return;
+        modelRequestPending.current = true; liveSocket.send(encodeWav(samples, LIVE_SAMPLE_RATE));
+      };
+
+      liveSocket.onopen = () => { setLiveSeconds(0); setLiveActive(true); waveformFrame.current = window.requestAnimationFrame(drawWaveform); snapshotTimer.current = window.setInterval(sendWindow, 1000); };
       liveSocket.onmessage = (event) => {
+        modelRequestPending.current = false;
         try {
-          if (typeof event.data !== "string") return;
+          if (typeof event.data !== 'string') return;
           const update = JSON.parse(event.data) as Result & { error?: string };
-          logWebSocket("onmessage", update);
-          if (update.error) {
-            setLiveError(update.error);
-            return;
-          }
-          setResult({
-            ...update,
-            mode: "pretrained",
-            model_message: "LIVE MODEL ANALYSIS - AASIST pretrained anti-spoofing model · current voice window",
-          });
-        } catch (error) {
-          logWebSocket("invalid server message", error);
-        }
+          if (update.error) { setLiveError(update.error); return; }
+          setResult({ ...update, mode: 'pretrained', model_message: 'LIVE MODEL ANALYSIS - rolling 4-second AASIST window' });
+        } catch (error) { logWebSocket('invalid server message', error); }
       };
-
-      liveSocket.onerror = () => {
-        logWebSocket("onerror", "Network error or connection refused");
-      };
-
+      liveSocket.onerror = () => logWebSocket('onerror', 'Network error or connection refused');
       liveSocket.onclose = (event) => {
-        logWebSocket("onclose", { code: event.code, reason: event.reason });
-        stopSegments.current?.();
-        stopSegments.current = null;
-        if (intentionalStop.current || event.code === 1000) {
-          setLiveError(null);
-        } else if (event.code === 1011 && event.reason.toLowerCase().includes("detector")) {
-          setLiveError("Backend closed the connection because the AASIST detector is unavailable.");
-        } else if (event.code === 1006) {
-          setLiveError("WebSocket connection refused or interrupted. Check that the backend is running and reachable.");
-        } else if (event.reason) {
-          setLiveError(`Backend closed the live connection (${event.code}): ${event.reason}`);
-        } else {
-          setLiveError(`Live connection closed unexpectedly (code ${event.code}).`);
-        }
-        mediaStream.current?.getTracks().forEach((track) => track.stop());
-        setLiveActive(false);
+        modelRequestPending.current = false;
+        if (snapshotTimer.current !== null) { window.clearInterval(snapshotTimer.current); snapshotTimer.current = null; }
+        if (waveformFrame.current !== null) { window.cancelAnimationFrame(waveformFrame.current); waveformFrame.current = null; }
+        if (intentionalStop.current || event.code === 1000) setLiveError(null);
+        else if (event.code === 1011 && event.reason.toLowerCase().includes('detector')) setLiveError('Backend closed the connection because the AASIST detector is unavailable.');
+        else if (event.code === 1006) setLiveError('WebSocket connection refused or interrupted. Check that the backend is running and reachable.');
+        else if (event.reason) setLiveError(`Backend closed the live connection (${event.code}): ${event.reason}`);
+        else setLiveError(`Live connection closed unexpectedly (code ${event.code}).`);
+        setLiveActive(false); mediaStream.current?.getTracks().forEach((track) => track.stop());
+        if (audioContext.current && audioContext.current.state !== 'closed') void audioContext.current.close(); audioContext.current = null;
       };
     } catch (error) {
-      setLiveError(
-        error instanceof DOMException && error.name === "NotAllowedError"
-          ? "Microphone permission was denied."
-          : error instanceof Error
-            ? error.message
-            : "Unable to start microphone analysis.",
-      );
+      setLiveError(error instanceof DOMException && error.name === 'NotAllowedError' ? 'Microphone permission was denied.' : error instanceof Error ? error.message : 'Unable to start microphone analysis.');
       stopLiveSimulation();
     }
   }
@@ -374,7 +369,7 @@ export default function Home() {
         <section className="vxy-section analyze-section reveal" id="analyze">
           <div className="section-heading"><div><span className="kicker">Live workspace</span><h2>Analyze a voice.</h2></div><p>Upload an audio clip or choose a labelled simulation. Demo values are never presented as genuine model predictions.</p></div>
           <div className="analyze-layout"><div className="upload-card"><div className="card-title"><FileAudio size={20} /><h3>Voice input</h3></div><p className="muted">WAV, MP3, M4A, or browser WebM. Audio is processed temporarily.</p><label className="dropzone"><Upload size={27} /><strong>Choose a recording</strong><span>Send it to the VOXY pipeline</span><input type="file" accept="audio/*" onChange={(event) => analyzeFile(event.target.files?.[0])} /></label><div className="demo-row"><button onClick={() => chooseDemo("human")}>Human / demo</button><button onClick={() => chooseDemo("synthetic")}>Synthetic / demo</button><button onClick={() => chooseDemo("uncertain")}>Uncertain / demo</button></div><button className="text-action" onClick={() => { if (liveActive) stopLiveSimulation(true); else setCallOpen(!callOpen); }}><Mic size={16} /> {liveActive ? "Stop microphone simulation" : callOpen ? "Close microphone simulation" : "Open microphone simulation"}</button>{callOpen && <div className="inline-note"><strong>Browser Microphone Simulation</strong><p>Audio is streamed to VOXY for live AASIST analysis. It does not intercept cellular calls.</p>{liveActive ? <p className="live-status"><span className="live-dot" /> Listening · {liveSeconds}s</p> : <button className="vxy-pill primary" onClick={startLiveSimulation}>Start microphone analysis</button>}{liveError && <p role="alert">{liveError}</p>}</div>}</div>
-            <div className="result-card" aria-live="polite"><div className="result-top"><div><span className="kicker">Voice assessment</span><h3>{title}</h3></div><span className="badge">{badge}</span></div><div className="score">{Math.round(result.synthetic_score)}<span>/100</span></div><p className="muted">synthetic likelihood · model score, not a calibrated probability</p>{result.detector && result.mode !== "demo" && <p className="detector-label">{result.detector}</p>}<div className="meter"><i style={{ width: `${Math.max(0, Math.min(100, result.synthetic_score))}%` }} /></div><div className="metrics"><div><small>Risk score</small><strong>{result.risk_score}</strong></div><div><small>Risk level</small><strong>{result.risk_level}</strong></div><div><small>Windows</small><strong>{result.windows_analyzed}</strong></div></div><div className="timeline-graph" aria-label="Live synthetic score timeline">
+            <div className="result-card" aria-live="polite"><div className="result-top"><div><span className="kicker">Voice assessment</span><h3>{title}</h3></div><span className="badge">{badge}</span></div><div className="score">{liveActive && result.windows_analyzed === 0 ? "—" : Math.round(result.synthetic_score)}<span>/100</span></div><p className="muted">synthetic likelihood · model score, not a calibrated probability</p>{result.detector && result.mode !== "demo" && <p className="detector-label">{result.detector}</p>}<div className="meter"><i style={{ width: `${Math.max(0, Math.min(100, result.synthetic_score))}%` }} /></div><div className="metrics"><div><small>Risk score</small><strong>{result.risk_score}</strong></div><div><small>Risk level</small><strong>{result.risk_level}</strong></div><div><small>Windows</small><strong>{result.windows_analyzed}</strong></div></div><div className="timeline-graph" aria-label="Live synthetic score timeline">
               <svg viewBox="0 0 400 130" role="img" aria-label="Synthetic score by analysis window" style={{ width: "100%", height: "170px", display: "block", color: "#c6e93d" }}>
                 <line x1="0" y1="20" x2="400" y2="20" stroke="currentColor" strokeOpacity=".12" />
                 <line x1="0" y1="65" x2="400" y2="65" stroke="currentColor" strokeOpacity=".12" />
@@ -398,6 +393,12 @@ export default function Home() {
                   );
                 })()}
               </svg>
+            </div>
+            <div className="live-waveform-panel" style={{ marginTop: '10px', borderTop: '1px solid rgba(198,233,61,.12)', paddingTop: '10px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '7px', fontSize: '10px', letterSpacing: '.12em', textTransform: 'uppercase', color: 'rgba(198,233,61,.78)' }}>
+                <span>Live audio waveform</span><span>{liveActive ? 'MIC INPUT' : 'STANDBY'}</span>
+              </div>
+              <canvas ref={waveformCanvas} aria-label="Live microphone waveform" style={{ width: '100%', height: '105px', display: 'block', borderRadius: '10px', background: 'rgba(255,255,255,.018)' }} />
             </div>{result.risk_score >= 60 && <div className="verify-note"><strong>Verify before taking action.</strong><p>Ask a trusted question, contact the person through another channel, and do not share OTPs or transfer money based on the call alone.</p><button className="vxy-pill primary" onClick={() => setVerification(!verification)}>{verification ? <><Check size={15} /> Steps shown</> : "Verify caller"}</button>{verification && <p><Check size={15} /> End the call, use a trusted contact method, and independently confirm identity.</p>}</div>}<p className="model-message">{analysisError || result.model_message}</p></div></div>
         </section>
 

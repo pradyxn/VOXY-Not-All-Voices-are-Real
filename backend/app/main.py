@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import wave
+from time import perf_counter
 
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
@@ -74,7 +75,10 @@ async def analyze(audio: UploadFile = File(...)) -> AnalysisResponse:
             shutil.copyfileobj(audio.file, temporary)
             temporary_path = temporary.name
 
+        started = perf_counter()
         timeline, quality = await asyncio.to_thread(service.predict_file, temporary_path)
+        elapsed_ms = round((perf_counter() - started) * 1000.0)
+        print(f"VOXY upload: AASIST analysis completed in {elapsed_ms} ms")
         aggregate, stability, windows = aggregate_scores(timeline)
         risk, level = calculate_risk(aggregate, windows, stability, quality)
 
@@ -87,7 +91,7 @@ async def analyze(audio: UploadFile = File(...)) -> AnalysisResponse:
             audio_quality=quality,
             mode=service.mode,
             detector=service.detector,
-            model_message="AASIST spoof probability derived from the official 2-class output; higher means more synthetic/spoof signal.",
+            model_message=f"AASIST spoof probability derived from the official 2-class output; higher means more synthetic/spoof signal. Inference: {elapsed_ms} ms.",
             timeline=timeline,
         )
     except Exception as error:
@@ -120,13 +124,7 @@ def decode_live_wav(payload: bytes) -> np.ndarray:
 
 @app.websocket("/ws/analyze")
 async def analyze_stream(websocket: WebSocket) -> None:
-    """
-    Live microphone protocol.
-
-    The frontend sends one complete 16 kHz mono WAV snapshot containing exactly
-    one fixed AASIST input window. Decode it directly from memory so live
-    inference is not delayed by temporary-file I/O, librosa probing, or ffmpeg.
-    """
+    """Analyze complete fixed 16 kHz mono microphone snapshots with AASIST."""
     await websocket.accept()
 
     if service is None or not service.loaded:
@@ -158,24 +156,21 @@ async def analyze_stream(websocket: WebSocket) -> None:
                     print("VOXY live: snapshot contained insufficient usable audio")
                     continue
 
-                timeline = await asyncio.to_thread(service.predict_audio, audio)
-                model_scores, quality = timeline
+                started = perf_counter()
+                score = await asyncio.to_thread(service.predict_window, audio)
+                elapsed_ms = round((perf_counter() - started) * 1000.0)
+                print(f"VOXY live: AASIST inference completed in {elapsed_ms} ms")
 
-                if not model_scores:
-                    print("VOXY live: model returned no score for live snapshot")
-                    continue
-
-                score = float(model_scores[-1])
-                scores.append(score)
+                scores.append(float(score))
                 scores = scores[-MAX_WINDOWS:]
                 window_id += 1
 
                 _aggregate, stability, windows = aggregate_scores(scores)
-                risk, level = calculate_risk(score, windows, stability, quality)
+                risk, level = calculate_risk(float(score), windows, stability, quality)
 
                 payload = {
                     "window_id": window_id,
-                    "synthetic_score": round(score, 1),
+                    "synthetic_score": round(float(score), 1),
                     "risk_score": risk,
                     "risk_level": level,
                     "status": (
@@ -191,6 +186,7 @@ async def analyze_stream(websocket: WebSocket) -> None:
                     "mode": service.mode,
                     "detector": service.detector,
                     "timeline": scores,
+                    "inference_ms": elapsed_ms,
                 }
 
                 await websocket.send_json(payload)

@@ -26,8 +26,6 @@ class InferenceService:
             session_options = ort.SessionOptions()
             session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-            # Render's free instance is CPU-constrained; keep a single worker
-            # thread so multiple inference thread pools do not fight each other.
             session_options.intra_op_num_threads = 1
             session_options.inter_op_num_threads = 1
             self.session = ort.InferenceSession(
@@ -63,15 +61,12 @@ class InferenceService:
         quality = quality_check(audio)
         if quality == "insufficient":
             return [], quality, 0
-
         if len(audio) < TARGET_SAMPLES:
             return [], quality, 0
-
         available = 1 + (len(audio) - TARGET_SAMPLES) // WINDOW_HOP_SAMPLES
         available = min(available, MAX_WINDOWS)
         if available <= start_index:
             return [], quality, available
-
         windows = split_windows(audio)[:available]
         new_windows = windows[start_index:available]
         return [self.predict_window(window) for window in new_windows], quality, available
@@ -83,24 +78,20 @@ class InferenceService:
     def predict_window_details(self, audio: np.ndarray) -> tuple[float, float, float]:
         if not self.loaded or self.session is None:
             raise RuntimeError("AASIST detector is not loaded")
-
         waveform = np.asarray(pad_waveform(audio), dtype=np.float32)[None, :]
         with torch.inference_mode():
             logits = self.session.run(None, {self.session.get_inputs()[0].name: waveform})[0]
-
-            # Official AASIST class convention: 0 = spoof, 1 = bona fide.
             logits = np.asarray(logits, dtype=np.float32)
             if logits.shape != (1, 2):
                 raise RuntimeError(f"Unexpected AASIST output shape: {logits.shape}")
+            # Official AASIST class convention: index 0 = spoof, index 1 = bona fide.
             bona_fide_logit = float(logits[0, 1])
             spoof_logit = float(logits[0, 0])
-
-            # Official AASIST wrapper: logits[:, 1] is bona fide, and higher
-            # bona-fide evidence means lower synthetic likelihood. Use the
-            # monotonic transform of that score for VOXY's 0-100 scale.
-            synthetic_probability = 1.0 / (1.0 + np.exp(np.clip(bona_fide_logit, -60.0, 60.0)))
-            spoof_score = float(synthetic_probability * 100.0)
-
+            # Use the two-class margin instead of sigmoid(-bona_fide), which
+            # saturates around 0-5 for many clearly bona-fide recordings.
+            margin = spoof_logit - bona_fide_logit
+            spoof_score = float(50.0 + 50.0 * np.tanh(margin / 1.5))
+            spoof_score = float(np.clip(spoof_score, 0.0, 100.0))
         return bona_fide_logit, spoof_logit, round(spoof_score, 1)
 
     @property

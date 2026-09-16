@@ -1,9 +1,12 @@
 from contextlib import asynccontextmanager
 import asyncio
+from io import BytesIO
 from pathlib import Path
 import shutil
 import tempfile
+import wave
 
+import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -11,6 +14,7 @@ from .config import FRONTEND_ORIGIN, MAX_WINDOWS
 from .schemas import AnalysisResponse, HealthResponse
 from .ml.inference import InferenceService
 from .ml.aggregation import aggregate_scores
+from .ml.preprocessing import quality_check
 from .risk.engine import calculate_risk
 
 service: InferenceService | None = None
@@ -93,15 +97,35 @@ async def analyze(audio: UploadFile = File(...)) -> AnalysisResponse:
             Path(temporary_path).unlink(missing_ok=True)
 
 
+def decode_live_wav(payload: bytes) -> np.ndarray:
+    """Decode the frontend's fixed 16 kHz mono PCM snapshot without librosa/ffmpeg."""
+    with wave.open(BytesIO(payload), "rb") as wav:
+        channels = wav.getnchannels()
+        sample_width = wav.getsampwidth()
+        sample_rate = wav.getframerate()
+        frames = wav.readframes(wav.getnframes())
+
+    if channels != 1:
+        raise ValueError(f"Expected mono live audio, received {channels} channels")
+    if sample_width != 2:
+        raise ValueError(f"Expected 16-bit PCM live audio, received {sample_width * 8}-bit")
+    if sample_rate != 16000:
+        raise ValueError(f"Expected 16000 Hz live audio, received {sample_rate} Hz")
+
+    audio = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+    if audio.size == 0:
+        raise ValueError("Live audio snapshot was empty")
+    return audio
+
+
 @app.websocket("/ws/analyze")
 async def analyze_stream(websocket: WebSocket) -> None:
     """
     Live microphone protocol.
 
-    The frontend sends one complete, independently decodable WebM/Opus blob
-    approximately every four seconds. Each blob is decoded exactly once and
-    produces one AASIST score. Keeping segment boundaries explicit avoids trying
-    to decode incomplete MediaRecorder WebM fragments.
+    The frontend sends one complete 16 kHz mono WAV snapshot containing exactly
+    one fixed AASIST input window. Decode it directly from memory so live
+    inference is not delayed by temporary-file I/O, librosa probing, or ffmpeg.
     """
     await websocket.accept()
 
@@ -127,27 +151,21 @@ async def analyze_stream(websocket: WebSocket) -> None:
             if not chunk:
                 continue
 
-            temporary_path: str | None = None
             try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temporary:
-                    temporary.write(chunk)
-                    temporary_path = temporary.name
-
-                timeline, quality = await asyncio.to_thread(
-                    service.predict_file,
-                    temporary_path,
-                )
-
-                if not timeline:
-                    print("VOXY live: segment contained insufficient usable audio")
+                audio = decode_live_wav(chunk)
+                quality = quality_check(audio)
+                if quality == "insufficient":
+                    print("VOXY live: snapshot contained insufficient usable audio")
                     continue
 
-                # One complete four-second microphone segment is one fresh model
-                # decision. Keep the history for the graph/stability metric, but
-                # expose the CURRENT model score as synthetic_score so the 0-100
-                # display follows the voice being heard instead of being damped by
-                # an old median that can stay near the demo value for too long.
-                score = float(timeline[-1])
+                timeline = await asyncio.to_thread(service.predict_audio, audio)
+                model_scores, quality = timeline
+
+                if not model_scores:
+                    print("VOXY live: model returned no score for live snapshot")
+                    continue
+
+                score = float(model_scores[-1])
                 scores.append(score)
                 scores = scores[-MAX_WINDOWS:]
                 window_id += 1
@@ -182,13 +200,9 @@ async def analyze_stream(websocket: WebSocket) -> None:
                 )
 
             except Exception as error:
-                print(f"VOXY live segment error: {error}")
-                # Keep the WebSocket alive when one microphone segment is bad.
-                # The next complete segment can still be analyzed normally.
+                print(f"VOXY live snapshot error: {error}")
+                await websocket.send_json({"error": f"Live analysis failed: {error}"})
                 continue
-            finally:
-                if temporary_path:
-                    Path(temporary_path).unlink(missing_ok=True)
 
     except WebSocketDisconnect:
         return

@@ -56,6 +56,7 @@ export default function Home() {
   const mediaStream = useRef<MediaStream | null>(null);
   const socket = useRef<WebSocket | null>(null);
   const intentionalStop = useRef(false);
+  const stopSegments = useRef<(() => void) | null>(null);
   const [verification, setVerification] = useState(false);
   const [activeStep, setActiveStep] = useState(0);
 
@@ -129,9 +130,11 @@ export default function Home() {
 
   function stopLiveSimulation(silent = false) {
     intentionalStop.current = silent;
+    stopSegments.current?.();
+    stopSegments.current = null;
     if (mediaRecorder.current && mediaRecorder.current.state !== "inactive") mediaRecorder.current.stop();
     mediaStream.current?.getTracks().forEach((track) => track.stop());
-    socket.current?.close();
+    socket.current?.close(1000, "client stopped");
     mediaRecorder.current = null;
     mediaStream.current = null;
     socket.current = null;
@@ -145,33 +148,95 @@ export default function Home() {
       setLiveError("This browser does not support microphone recording.");
       return;
     }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "";
-      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : "";
       const webSocketUrl = getWebSocketUrl(API, window.location.protocol);
       logWebSocket("attempting connection", webSocketUrl);
       const liveSocket = new WebSocket(webSocketUrl);
+
       mediaStream.current = stream;
-      mediaRecorder.current = recorder;
       socket.current = liveSocket;
+      intentionalStop.current = false;
+
       liveSocket.onopen = () => {
         logWebSocket("onopen");
-        intentionalStop.current = false;
         setLiveSeconds(0);
         setLiveActive(true);
-        recorder.start(1000);
+
+        // Send complete, independently decodable WebM segments. Sending
+        // MediaRecorder timeslice fragments caused incomplete WebM containers
+        // to reach the backend and fail during decoding.
+        let segmentRecorder: MediaRecorder | null = null;
+        let stopped = false;
+
+        const recordSegment = () => {
+          if (stopped || liveSocket.readyState !== WebSocket.OPEN) return;
+
+          const chunks: Blob[] = [];
+          const nextRecorder = mimeType
+            ? new MediaRecorder(stream, { mimeType })
+            : new MediaRecorder(stream);
+          segmentRecorder = nextRecorder;
+
+          nextRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) chunks.push(event.data);
+          };
+
+          nextRecorder.onerror = () => {
+            setLiveError("Microphone recording stopped unexpectedly.");
+          };
+
+          nextRecorder.onstop = () => {
+            if (stopped) return;
+            const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
+            if (blob.size > 0 && liveSocket.readyState === WebSocket.OPEN) {
+              logWebSocket("sending complete segment", { bytes: blob.size });
+              liveSocket.send(blob);
+            }
+            window.setTimeout(recordSegment, 25);
+          };
+
+          nextRecorder.start();
+          window.setTimeout(() => {
+            if (nextRecorder.state === "recording") nextRecorder.stop();
+          }, 4000);
+        };
+
+        stopSegments.current = () => {
+          stopped = true;
+          if (segmentRecorder && segmentRecorder.state !== "inactive") segmentRecorder.stop();
+        };
+
+        recordSegment();
       };
+
       liveSocket.onmessage = (event) => {
-        logWebSocket("onmessage", { bytes: event.data instanceof Blob ? event.data.size : undefined });
-        const update = JSON.parse(event.data) as Result;
-        setResult({ ...update, mode: "pretrained", model_message: "LIVE MODEL ANALYSIS - AASIST pretrained anti-spoofing model" });
+        try {
+          if (typeof event.data !== "string") return;
+          const update = JSON.parse(event.data) as Result;
+          logWebSocket("onmessage", update);
+          setResult({
+            ...update,
+            mode: "pretrained",
+            model_message: "LIVE MODEL ANALYSIS - AASIST pretrained anti-spoofing model",
+          });
+        } catch (error) {
+          logWebSocket("invalid server message", error);
+        }
       };
+
       liveSocket.onerror = () => {
         logWebSocket("onerror", "Network error or connection refused");
       };
+
       liveSocket.onclose = (event) => {
         logWebSocket("onclose", { code: event.code, reason: event.reason });
+        stopSegments.current?.();
+        stopSegments.current = null;
         if (intentionalStop.current || event.code === 1000) {
           setLiveError(null);
         } else if (event.code === 1011 && event.reason.toLowerCase().includes("detector")) {
@@ -186,12 +251,14 @@ export default function Home() {
         mediaStream.current?.getTracks().forEach((track) => track.stop());
         setLiveActive(false);
       };
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0 && liveSocket.readyState === WebSocket.OPEN) liveSocket.send(event.data);
-      };
-      recorder.onerror = () => setLiveError("Microphone recording stopped unexpectedly.");
     } catch (error) {
-      setLiveError(error instanceof DOMException && error.name === "NotAllowedError" ? "Microphone permission was denied." : error instanceof Error ? error.message : "Unable to start microphone analysis.");
+      setLiveError(
+        error instanceof DOMException && error.name === "NotAllowedError"
+          ? "Microphone permission was denied."
+          : error instanceof Error
+            ? error.message
+            : "Unable to start microphone analysis.",
+      );
       stopLiveSimulation();
     }
   }
@@ -273,7 +340,31 @@ export default function Home() {
         <section className="vxy-section analyze-section reveal" id="analyze">
           <div className="section-heading"><div><span className="kicker">Live workspace</span><h2>Analyze a voice.</h2></div><p>Upload an audio clip or choose a labelled simulation. Demo values are never presented as genuine model predictions.</p></div>
           <div className="analyze-layout"><div className="upload-card"><div className="card-title"><FileAudio size={20} /><h3>Voice input</h3></div><p className="muted">WAV, MP3, M4A, or browser WebM. Audio is processed temporarily.</p><label className="dropzone"><Upload size={27} /><strong>Choose a recording</strong><span>Send it to the VOXY pipeline</span><input type="file" accept="audio/*" onChange={(event) => analyzeFile(event.target.files?.[0])} /></label><div className="demo-row"><button onClick={() => chooseDemo("human")}>Human / demo</button><button onClick={() => chooseDemo("synthetic")}>Synthetic / demo</button><button onClick={() => chooseDemo("uncertain")}>Uncertain / demo</button></div><button className="text-action" onClick={() => { if (liveActive) stopLiveSimulation(true); else setCallOpen(!callOpen); }}><Mic size={16} /> {liveActive ? "Stop microphone simulation" : callOpen ? "Close microphone simulation" : "Open microphone simulation"}</button>{callOpen && <div className="inline-note"><strong>Browser Microphone Simulation</strong><p>Audio is streamed to VOXY for live AASIST analysis. It does not intercept cellular calls.</p>{liveActive ? <p className="live-status"><span className="live-dot" /> Listening · {liveSeconds}s</p> : <button className="vxy-pill primary" onClick={startLiveSimulation}>Start microphone analysis</button>}{liveError && <p role="alert">{liveError}</p>}</div>}</div>
-            <div className="result-card" aria-live="polite"><div className="result-top"><div><span className="kicker">Voice assessment</span><h3>{title}</h3></div><span className="badge">{result.mode === "demo" ? "SIMULATION" : result.risk_level}</span></div><div className="score">{Math.round(result.synthetic_score)}<span>/100</span></div><p className="muted">synthetic likelihood · model score, not a calibrated probability</p>{result.detector && result.mode !== "demo" && <p className="detector-label">{result.detector}</p>}<div className="meter"><i style={{ width: `${result.synthetic_score}%` }} /></div><div className="metrics"><div><small>Risk score</small><strong>{result.risk_score}</strong></div><div><small>Risk level</small><strong>{result.risk_level}</strong></div><div><small>Windows</small><strong>{result.windows_analyzed}</strong></div></div><div className="timeline-bars">{result.timeline.map((score, index) => <div key={index} style={{ height: `${Math.max(score, 8)}%` }} title={`Window ${index + 1}: ${score}`} />)}</div>{result.risk_score >= 60 && <div className="verify-note"><strong>Verify before taking action.</strong><p>Ask a trusted question, contact the person through another channel, and do not share OTPs or transfer money based on the call alone.</p><button className="vxy-pill primary" onClick={() => setVerification(!verification)}>{verification ? <><Check size={15} /> Steps shown</> : "Verify caller"}</button>{verification && <p><Check size={15} /> End the call, use a trusted contact method, and independently confirm identity.</p>}</div>}<p className="model-message">{analysisError || result.model_message}</p></div></div>
+            <div className="result-card" aria-live="polite"><div className="result-top"><div><span className="kicker">Voice assessment</span><h3>{title}</h3></div><span className="badge">{result.mode === "demo" ? "SIMULATION" : result.risk_level}</span></div><div className="score">{Math.round(result.synthetic_score)}<span>/100</span></div><p className="muted">synthetic likelihood · model score, not a calibrated probability</p>{result.detector && result.mode !== "demo" && <p className="detector-label">{result.detector}</p>}<div className="meter"><i style={{ width: `${result.synthetic_score}%` }} /></div><div className="metrics"><div><small>Risk score</small><strong>{result.risk_score}</strong></div><div><small>Risk level</small><strong>{result.risk_level}</strong></div><div><small>Windows</small><strong>{result.windows_analyzed}</strong></div></div><div className="timeline-graph" aria-label="Live synthetic score timeline">
+              <svg viewBox="0 0 400 130" role="img" aria-label="Synthetic score by analysis window" style={{ width: "100%", height: "170px", display: "block", color: "#c6e93d" }}>
+                <line x1="0" y1="20" x2="400" y2="20" stroke="currentColor" strokeOpacity=".12" />
+                <line x1="0" y1="65" x2="400" y2="65" stroke="currentColor" strokeOpacity=".12" />
+                <line x1="0" y1="110" x2="400" y2="110" stroke="currentColor" strokeOpacity=".12" />
+                {result.timeline.length > 0 && (() => {
+                  const denominator = Math.max(result.timeline.length - 1, 1);
+                  const points = result.timeline.map((score, index) => {
+                    const x = (index / denominator) * 400;
+                    const y = 110 - (Math.max(0, Math.min(score, 100)) * 0.9);
+                    return { x, y, score, index };
+                  });
+                  return (
+                    <>
+                      <polyline fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" points={points.map((point) => `${point.x},${point.y}`).join(" ")} />
+                      {points.map((point) => (
+                        <circle key={point.index} cx={point.x} cy={point.y} r="4.5" fill="currentColor">
+                          <title>{`Window ${point.index + 1}: ${point.score}`}</title>
+                        </circle>
+                      ))}
+                    </>
+                  );
+                })()}
+              </svg>
+            </div>{result.risk_score >= 60 && <div className="verify-note"><strong>Verify before taking action.</strong><p>Ask a trusted question, contact the person through another channel, and do not share OTPs or transfer money based on the call alone.</p><button className="vxy-pill primary" onClick={() => setVerification(!verification)}>{verification ? <><Check size={15} /> Steps shown</> : "Verify caller"}</button>{verification && <p><Check size={15} /> End the call, use a trusted contact method, and independently confirm identity.</p>}</div>}<p className="model-message">{analysisError || result.model_message}</p></div></div>
         </section>
 
         <section className="vxy-section split-section reveal" id="insights"><div><span className="kicker">HOW VOXY WORKS</span><h2>From voice<br />to risk signal.</h2></div><p>Audio enters VOXY as a short voice sample. We normalize it to 16 kHz, split it into overlapping 4-second windows, and analyze each raw waveform with the pretrained AASIST anti-spoofing model. Results are aggregated across the recording to produce a 0–100 spoof-risk score.</p></section>

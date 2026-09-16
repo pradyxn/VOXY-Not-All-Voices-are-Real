@@ -2,11 +2,11 @@ from contextlib import asynccontextmanager
 import asyncio
 from pathlib import Path
 import shutil
-import subprocess
 import tempfile
+import time
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from .config import FRONTEND_ORIGIN, MAX_WINDOWS, SAMPLE_RATE, TARGET_SAMPLES
+from .config import FRONTEND_ORIGIN, MAX_WINDOWS
 from .schemas import AnalysisResponse, HealthResponse
 from .ml.inference import InferenceService
 from .ml.aggregation import aggregate_scores
@@ -60,9 +60,15 @@ async def analyze_stream(websocket: WebSocket) -> None:
     if service is None or not service.loaded:
         await websocket.close(code=1011, reason="AASIST detector is unavailable")
         return
+
+    # MediaRecorder sends approximately one WebM chunk per second. Decode only
+    # every two chunks and run AASIST only for genuinely new complete windows.
+    # This avoids re-running the model over the entire growing recording.
     audio_buffer = bytearray()
+    received_chunks = 0
     analyzed_windows = 0
     scores: list[float] = []
+
     try:
         while True:
             message = await websocket.receive()
@@ -70,25 +76,63 @@ async def analyze_stream(websocket: WebSocket) -> None:
                 return
             if message.get("text") == "stop":
                 return
+
             chunk = message.get("bytes")
             if not chunk:
                 continue
+
             audio_buffer.extend(chunk)
-            if len(audio_buffer) < 16_000 or analyzed_windows >= MAX_WINDOWS:
+            received_chunks += 1
+
+            # The frontend uses MediaRecorder(...).start(1000), so checking
+            # every second chunk gives us roughly a two-second cadence. This
+            # is only a decode check; AASIST does not run until a full window
+            # is actually available.
+            if received_chunks % 2 != 0 or analyzed_windows >= MAX_WINDOWS:
                 continue
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temporary:
-                temporary.write(audio_buffer)
-                temporary_path = temporary.name
+
+            temporary_path: str | None = None
             try:
-                timeline, quality = await asyncio.to_thread(service.predict_file, temporary_path)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temporary:
+                    temporary.write(audio_buffer)
+                    temporary_path = temporary.name
+
+                started = time.perf_counter()
+                new_scores, quality, available_windows = await asyncio.to_thread(
+                    service.predict_new_file_windows,
+                    temporary_path,
+                    analyzed_windows,
+                )
+                elapsed = time.perf_counter() - started
+
+                if new_scores:
+                    for score in new_scores:
+                        scores.append(score)
+                        analyzed_windows += 1
+                        aggregate, stability, windows = aggregate_scores(scores[-MAX_WINDOWS:])
+                        risk, level = calculate_risk(aggregate, windows, stability, quality)
+                        await websocket.send_json({
+                            "window_id": analyzed_windows,
+                            "synthetic_score": aggregate,
+                            "risk_score": risk,
+                            "risk_level": level,
+                            "status": "suspicious" if aggregate >= 60 else "human" if aggregate < 35 else "uncertain",
+                            "stability": stability,
+                            "audio_quality": quality,
+                            "windows_analyzed": windows,
+                            "mode": service.mode,
+                            "detector": service.detector,
+                            "timeline": scores[-MAX_WINDOWS:],
+                        })
+                    print(f"VOXY live: analyzed {len(new_scores)} new window(s) in {elapsed:.2f}s; total={analyzed_windows}")
+                elif available_windows == 0:
+                    print("VOXY live: waiting for first complete 4-second window")
+            except Exception as error:
+                print(f"VOXY live analysis error: {error}")
+                await websocket.close(code=1011, reason="Live AASIST analysis failed")
+                return
             finally:
-                Path(temporary_path).unlink(missing_ok=True)
-            new_scores = timeline[analyzed_windows:]
-            for score in new_scores:
-                scores.append(score)
-                analyzed_windows += 1
-                aggregate, stability, windows = aggregate_scores(scores[-MAX_WINDOWS:])
-                risk, level = calculate_risk(aggregate, windows, stability, quality)
-                await websocket.send_json({"window_id": analyzed_windows, "synthetic_score": aggregate, "risk_score": risk, "risk_level": level, "status": "suspicious" if aggregate >= 60 else "human" if aggregate < 35 else "uncertain", "stability": stability, "audio_quality": quality, "windows_analyzed": windows, "mode": service.mode, "detector": service.detector, "timeline": scores[-MAX_WINDOWS:]})
+                if temporary_path:
+                    Path(temporary_path).unlink(missing_ok=True)
     except WebSocketDisconnect:
         return

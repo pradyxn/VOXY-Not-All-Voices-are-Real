@@ -232,7 +232,7 @@ export default function Home() {
     if (!navigator.mediaDevices?.getUserMedia || !window.AudioContext) { setLiveError("This browser does not support live microphone analysis."); return; }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const context = new AudioContext({ sampleRate: LIVE_SAMPLE_RATE });
+      const context = new AudioContext();
       await context.resume();
       const source = context.createMediaStreamSource(stream);
       const analyserNode = context.createAnalyser();
@@ -297,7 +297,7 @@ export default function Home() {
         let offset = 0;
         for (const chunk of pcmChunks.current) { joined.set(chunk, offset); offset += chunk.length; }
         const recent = joined.subarray(Math.max(0, joined.length - needed));
-        return context.sampleRate === LIVE_SAMPLE_RATE ? downsampleToTarget(recent) : downsampleToTarget(recent);
+        return downsampleToTarget(recent);
       };
 
       const sendWindow = async () => {

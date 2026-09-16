@@ -72,7 +72,7 @@ Temporary server-side WebM/audio file
 16 kHz mono conversion
         |
         v
-4-second-class windows / 64,600 samples
+~4-second windows / 64,600 samples
         |
         v
 Raw float32 waveform, padded/repeated to 64,600 samples
@@ -329,10 +329,9 @@ npm run start
 
 ## Legacy Training
 
-The old training script uses the ASVspoof LA train and dev protocols and writes the archived smoke-test VoiceCNN files. It is not part of production inference and should not be used to claim detector quality.
+The old training script uses the ASVspoof LA train and dev protocols and writes the archived smoke-test VoiceCNN checkpoint. It is not part of production inference and should not be used to claim detector quality.
 
 - `models/model_final.pth`
-- historical metadata/checkpoint path
 
 Run the legacy integration smoke test only when maintaining that historical path:
 

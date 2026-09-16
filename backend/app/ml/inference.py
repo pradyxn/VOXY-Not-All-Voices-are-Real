@@ -2,7 +2,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from .preprocessing import load_audio, quality_check, split_windows
-from ..config import MAX_WINDOWS, MODEL_PATH, SAMPLE_RATE, TARGET_SAMPLES, WINDOW_HOP_SAMPLES
+from ..config import MAX_WINDOWS, MODEL_PATH, TARGET_SAMPLES, WINDOW_HOP_SAMPLES
 
 
 class InferenceService:
@@ -116,6 +116,11 @@ class InferenceService:
 
 
 def pad_waveform(audio: np.ndarray) -> np.ndarray:
-    if len(audio) >= TARGET_SAMPLES:
+    """Match the official AASIST eval padding: repeat, then take 64600 samples."""
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if audio.size == 0:
+        return np.zeros(TARGET_SAMPLES, dtype=np.float32)
+    if audio.size >= TARGET_SAMPLES:
         return audio[:TARGET_SAMPLES]
-    return np.pad(audio, (0, TARGET_SAMPLES - len(audio)))
+    repeats = (TARGET_SAMPLES + audio.size - 1) // audio.size
+    return np.tile(audio, repeats)[:TARGET_SAMPLES]

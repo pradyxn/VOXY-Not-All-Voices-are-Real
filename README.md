@@ -2,7 +2,7 @@
 
 ## Not All Voices Are Real.
 
-VOXY is an AI voice-security prototype for analyzing acoustic signals associated with synthetic or cloned speech. It accepts an audio recording, normalizes it to 16 kHz mono, evaluates overlapping raw-waveform windows with the pretrained AASIST anti-spoofing model, aggregates evidence across windows, and presents a 0-100 risk signal with practical verification guidance.
+VOXY is an AI voice-security prototype for analyzing acoustic signals associated with synthetic or cloned speech. It accepts an audio recording, normalizes it to 16 kHz mono, evaluates overlapping raw-waveform windows with the pretrained AASIST anti-spoofing model, and presents a 0-100 risk signal with practical verification guidance.
 
 VOXY is decision support, not an infallible detector. It does not guarantee that a voice is real or fake, identify the caller, or replace independent verification.
 
@@ -31,14 +31,12 @@ The repository currently contains:
 |   |   |-- ml/
 |   |   |   |-- model.py             Archived smoke-test architecture (unused)
 |   |   |   |-- preprocessing.py     Raw waveform/audio decoding pipeline
-|   |   |   |-- inference.py         File inference service
-|   |   |   |-- aggregation.py       Rolling score aggregation
+|   |   |   |-- inference.py         AASIST inference service
+|   |   |   |-- aggregation.py       Rolling score aggregation helpers
 |   |   |-- risk/
 |   |       |-- engine.py            Risk-level calculation
 |   |-- requirements.txt
 |   |-- setup.bat                    Creates the backend venv and starts Uvicorn
-|-- data/
-|   |-- LA/LA/                       ASVspoof 2019 LA dataset layout
 |-- frontend/
 |   |-- app/
 |   |   |-- page.tsx                 VOXY homepage and analysis workspace
@@ -51,10 +49,11 @@ The repository currently contains:
 |   |-- model_final.pth              Archived smoke-test checkpoint, unused in production
 |   |-- model_metadata.json          AASIST checkpoint and score metadata
 |-- scripts/
-|   |-- train.py                     ASVspoof LA training and smoke-test script
-|   |-- test_model.py                Model tensor/output smoke check
-|   |-- test_audio.py                Risk and audio-quality checks
+|   |-- train.py                     Legacy ASVspoof LA training and smoke-test script
+|   |-- test_model.py                Legacy model tensor/output smoke check
+|   |-- test_audio.py                Audio-quality and risk-threshold checks
 |-- sample_audio/                    Optional local audio fixtures
+|-- setup_model.py                   Downloads and verifies the AASIST ONNX model
 |-- start_voxy.bat                   Starts backend, frontend, and browser
 |-- README.md
 ```
@@ -64,28 +63,32 @@ The repository currently contains:
 VOXY is organized into a shared analysis path:
 
 ```text
-Audio file or microphone bytes
+Audio file or browser microphone
         |
         v
-Temporary server-side audio file
+Temporary server-side WebM/audio file
         |
         v
 16 kHz mono conversion
         |
         v
-4-second / 64,000-sample windows
+4-second-class windows / 64,600 samples
         |
         v
-Raw float32 waveform, padded/truncated to 64,600 samples
+Raw float32 waveform, padded/repeated to 64,600 samples
         |
         v
 AASIST pretrained anti-spoofing inference
         |
         v
-Window scores -> rolling/EMA aggregation
+Current window score + history
+        |
+        +--> upload: median aggregation across windows
+        |
+        +--> live: latest window score + history for timeline/stability
         |
         v
-0-100 synthetic-likelihood signal
+0-100 synthetic/spoof signal
         |
         v
 Risk score, risk level, timeline, and verification guidance
@@ -103,7 +106,8 @@ The frontend is a Next.js App Router application using React and TypeScript. The
 - Interactive detection pipeline steps.
 - Existing audio analysis workspace.
 - Human, Synthetic, and Uncertain labelled demo states.
-- Risk result card with score, level, windows, timeline, and verification guidance.
+- Live microphone simulation using a WebSocket and complete 4-second WebM/Opus segments.
+- Live result card with current model score, risk level, windows, and timeline.
 - Minimal Contact modal with a `mailto:` link.
 
 The current visual system is implemented with plain global CSS in `frontend/app/globals.css`. No new frontend dependency is required for the acoustic visual or the motion system. The project has Framer Motion listed in `package.json`, but the current page uses CSS animations and `IntersectionObserver` rather than importing Framer Motion.
@@ -134,8 +138,9 @@ Example response:
 {
   "status": "ok",
   "model_loaded": true,
-  "mode": "ml",
-  "device": "CUDA",
+  "mode": "pretrained",
+  "detector": "AASIST pretrained anti-spoofing model",
+  "device": "CPU",
   "ffmpeg_available": true
 }
 ```
@@ -168,8 +173,8 @@ The response contains:
   "risk_level": "LOW | MODERATE | HIGH | CRITICAL",
   "windows_analyzed": 0,
   "audio_quality": "good | clipped | insufficient",
-        "mode": "pretrained | demo",
-        "detector": "AASIST pretrained anti-spoofing model",
+  "mode": "pretrained",
+  "detector": "AASIST pretrained anti-spoofing model",
   "model_message": null,
   "timeline": []
 }
@@ -183,7 +188,9 @@ Uploaded files are written to a temporary path for analysis and removed in the b
 WebSocket /ws/analyze
 ```
 
-The browser microphone simulation sends WebM/Opus chunks over the WebSocket. The backend buffers and decodes them, runs AASIST after enough audio is available, and returns incremental real model scores. A normal browser cannot intercept arbitrary cellular-call audio.
+The browser microphone path opens a WebSocket and sends one complete, independently decodable WebM/Opus recording segment approximately every four seconds. The backend decodes each segment, runs one AASIST inference, and returns that current model score. The frontend updates the score card, risk level, window counter, and timeline from the returned JSON. A normal browser cannot intercept arbitrary cellular-call audio.
+
+A live update is therefore windowed rather than sample-by-sample: the model requires a fixed 64,600-sample waveform, so each new decision arrives after a complete segment plus backend inference time.
 
 ## Backend and ML Configuration
 
@@ -193,20 +200,21 @@ The shared configuration in `backend/app/config.py` defines:
 |---|---:|---|
 | Sample rate | 16,000 Hz | Target audio rate |
 | Target samples | 64,600 | AASIST model input |
-| Window hop | 32,300 | 50% overlap |
+| Window hop | 32,300 | 50% overlap for longer recordings |
 | Maximum windows | 8 | Upload/live workload bound |
-| Aggregation | Median | Robust temporal score |
+| Upload aggregation | Median | Robust multi-window score |
+| Live display | Latest window | Immediate current-window response |
 
-The AASIST ONNX model returns two logits:
+The official AASIST training convention used by the production mapping is:
 
 ```text
-bonafide -> logit 0
-spoof    -> logit 1
-
-The published AASIST convention is higher bona fide. VOXY explicitly converts the logits with `sigmoid(spoof_logit - bonafide_logit) * 100`, so higher VOXY scores indicate more model-indicated spoof risk. This is a score, not a calibrated probability.
+spoof    -> logit 0
+bonafide -> logit 1
 ```
 
-The inference service loads `models/AASIST.onnx` once when FastAPI starts. If it is missing or cannot load, startup fails clearly; the upload endpoint never substitutes fabricated scores. Demo values remain frontend-only and are explicitly labelled.
+VOXY converts those two logits into a synthetic/spoof score using a softmax-equivalent two-class probability for class 0. Higher VOXY scores therefore mean stronger model-indicated spoof/synthetic signal. This is a score, not a calibrated probability.
+
+The inference service loads `models/AASIST.onnx` once when FastAPI starts. If it is missing or cannot load, startup fails clearly; the upload and WebSocket paths never substitute fabricated scores. Demo values remain frontend-only and are explicitly labelled.
 
 Prototype risk bands are:
 
@@ -221,7 +229,7 @@ These are product prototype thresholds, not calibrated scientific confidence int
 
 ## Dataset Layout
 
-The training script expects ASVspoof 2019 LA under:
+The legacy training script expects ASVspoof 2019 LA under:
 
 ```text
 data/LA/LA/
@@ -233,7 +241,7 @@ data/LA/LA/
 |   |-- ASVspoof2019.LA.cm.dev.trl.txt
 ```
 
-`scripts/train.py` reads the train and dev protocol files, validates that every referenced FLAC file exists, maps `bonafide` and `spoof` labels, and uses the same `load_audio()` and `create_model_tensor()` functions as backend inference.
+`scripts/train.py` reads the train and dev protocol files, validates that every referenced FLAC file exists, maps `bonafide` and `spoof` labels, and uses the same `load_audio()` and `create_model_tensor()` functions as the legacy training path.
 
 The dataset is not redistributed by this repository. Place the dataset in the expected local path and comply with its license and access terms.
 
@@ -241,7 +249,7 @@ The dataset is not redistributed by this repository. Place the dataset in the ex
 
 Prerequisites:
 
-- Python 3.11 or a compatible Python version supported by the pinned packages.
+- Python 3.12 (the hosted deployment is pinned to Python 3.12).
 - Node.js and npm.
 - FFmpeg available on `PATH`.
 - NVIDIA CUDA support is optional. The detector selects ONNX Runtime CUDA when available and otherwise uses CPU.
@@ -253,28 +261,26 @@ FFmpeg is important because browser `MediaRecorder` commonly produces WebM/Opus 
 From the repository root:
 
 ```bat
-cd /d "C:\Users\prady\Documents\Omniroute\Projects\Voxy-Not All Voices are Real"
 call "backend\setup.bat"
 ```
 
 The setup script creates `backend/.venv`, installs `backend/requirements.txt`, checks for FFmpeg, and starts Uvicorn on port 8000. To only install dependencies, run the commands manually:
 
 ```bat
-cd /d "C:\Users\prady\Documents\Omniroute\Projects\Voxy-Not All Voices are Real\backend"
+cd backend
 python -m venv .venv
 call ".venv\Scripts\activate.bat"
 python -m pip install -r requirements.txt
-
 cd ..
 python setup_model.py
 ```
 
-`setup_model.py` downloads the official maintained AASIST checkpoint from Hugging Face and verifies its `[batch, 64600] -> [batch, 2]` inference contract. The model is ignored by Git and must be downloaded on each new machine.
+`setup_model.py` downloads the official AASIST checkpoint from Hugging Face and verifies its `[batch, 64600] -> [batch, 2]` inference contract. The model is ignored by Git and must be downloaded on each new machine.
 
 ### Frontend setup
 
 ```bat
-cd /d "C:\Users\prady\Documents\Omniroute\Projects\Voxy-Not All Voices are Real\frontend"
+cd frontend
 npm install
 ```
 
@@ -295,7 +301,7 @@ This checks FFmpeg, initializes the backend environment if needed, opens the bac
 Start the backend in one terminal:
 
 ```bat
-cd /d "C:\Users\prady\Documents\Omniroute\Projects\Voxy-Not All Voices are Real\backend"
+cd backend
 call ".venv\Scripts\activate.bat"
 uvicorn app.main:app --reload --port 8000
 ```
@@ -303,7 +309,7 @@ uvicorn app.main:app --reload --port 8000
 Start the frontend in another terminal:
 
 ```bat
-cd /d "C:\Users\prady\Documents\Omniroute\Projects\Voxy-Not All Voices are Real\frontend"
+cd frontend
 npm run dev
 ```
 
@@ -316,7 +322,7 @@ Open:
 For a production-style frontend preview:
 
 ```bat
-cd /d "C:\Users\prady\Documents\Omniroute\Projects\Voxy-Not All Voices are Real\frontend"
+cd frontend
 npm run build
 npm run start
 ```
@@ -326,38 +332,15 @@ npm run start
 The old training script uses the ASVspoof LA train and dev protocols and writes the archived smoke-test VoiceCNN files. It is not part of production inference and should not be used to claim detector quality.
 
 - `models/model_final.pth`
-- `models/model_metadata.json`
+- historical metadata/checkpoint path
 
 Run the legacy integration smoke test only when maintaining that historical path:
 
 ```bat
-cd /d "C:\Users\prady\Documents\Omniroute\Projects\Voxy-Not All Voices are Real"
-call ".venv\Scripts\activate.bat"
 python scripts\train.py --smoke-test
 ```
 
 The smoke test selects a small balanced subset, performs a limited train/dev pass, and validates checkpoint creation. It is an integration test, not a meaningful accuracy evaluation.
-
-For a full train/dev run:
-
-```bat
-python scripts\train.py --epochs 20 --batch-size 8 --learning-rate 0.0001
-```
-
-Useful options:
-
-```text
---epochs          Number of training epochs; default 20
---batch-size      Batch size; default 8
---learning-rate   Adam learning rate; default 1e-4
---num-workers     DataLoader workers; default 0, recommended on Windows
---seed            Reproducibility seed; default 42
---smoke-test      Run the small balanced integration pass
---smoke-batches   Maximum batches per smoke-test phase; default 2
---smoke-samples   Number of train samples in smoke mode; default 16
-```
-
-The best checkpoint is selected by dev F1. Always review the full dev metrics and test on a separate evaluation set before making performance claims.
 
 ## Verification and Tests
 
@@ -378,32 +361,26 @@ python scripts\test_audio.py
 Frontend production validation:
 
 ```bat
-cd /d "C:\Users\prady\Documents\Omniroute\Projects\Voxy-Not All Voices are Real\frontend"
+cd frontend
 npm run build
 ```
 
 Manual integration checks should include:
 
 1. `GET /api/health` returns `status: ok`, `model_loaded: true`, `detector: AASIST`, and `device: CPU` or `CUDA`.
-2. The homepage opens on port 3000.
+2. The homepage opens.
 3. A labelled demo changes the result card.
 4. A supported audio upload returns real AASIST-derived scores and `mode: pretrained`.
-5. The `Analyze a voice` CTA reaches the existing workspace.
-6. The Contact modal uses `mailto:pradyun.marukala@gmail.com`.
-7. Open microphone simulation, grant permission, and confirm live windows update the result card.
+5. Open microphone simulation, grant permission, and confirm the UI first changes to `LISTENING`, then receives a real result after the first complete window.
+6. Continue speaking and confirm subsequent windows replace the displayed current score and append to the timeline.
+7. Stop microphone simulation and confirm the WebSocket closes cleanly without an error banner.
+8. The Contact modal uses `mailto:pradyun.marukala@gmail.com`.
 
 ## Troubleshooting
 
 ### Frontend shows a Next.js runtime or missing-chunk error
 
-The development server and production build must not run against the same `.next` directory simultaneously. Stop stale Node processes, clear generated artifacts, and start one frontend server:
-
-```powershell
-Get-Process -Name node -ErrorAction SilentlyContinue | Stop-Process -Force
-Set-Location "C:\Users\prady\Documents\Omniroute\Projects\Voxy-Not All Voices are Real\frontend"
-Remove-Item -Recurse -Force .next
-npm run dev -- --port 3000
-```
+The development server and production build must not run against the same `.next` directory simultaneously. Stop stale Node processes, clear generated artifacts, and start one frontend server.
 
 ### Backend reports a missing detector
 
@@ -432,7 +409,7 @@ Health reports `CUDA` only when `CUDAExecutionProvider` is available and selecte
 
 ### Audio is marked insufficient
 
-The quality gate rejects empty, very short, silent, or heavily clipped audio. Use a clear recording with at least approximately one second of audible content; the model still analyzes fixed four-second windows after preprocessing.
+The quality gate rejects empty, very short, silent, or heavily clipped audio. Use a clear recording with at least approximately one second of audible content. A shorter usable recording can still be padded according to the AASIST input contract.
 
 ## Privacy and Limitations
 
@@ -455,12 +432,6 @@ Potential next steps include:
 - Full ASVspoof LA training and independent evaluation.
 - Calibration of synthetic-likelihood and risk thresholds.
 - Separate test-set reporting with reproducible metrics.
-- Richer spectral, prosodic, and temporal feature branches.
-- Native mobile audio integration with explicit operating-system permissions.
-- A production authentication and user-session model.
-- Stronger streaming inference around the existing WebSocket contract.
-- Privacy-preserving deployment options after the threat model is defined.
-
-## License and Dataset Notice
-
-This repository is a project prototype. Dataset files are not redistributed here. Use ASVspoof data according to its own terms, and review all third-party dependency licenses before deploying VOXY beyond local development.
+- Lower-latency streaming with model-compatible rolling buffers.
+- Native mobile call integration where operating-system permissions allow it.
+- Model ensembles and additional spoofing datasets.

@@ -24,10 +24,16 @@ def ffmpeg_available() -> bool:
 async def lifespan(_: FastAPI):
     global service
     service = InferenceService()
+    print(
+        f"VOXY startup: detector_loaded={service.loaded} "
+        f"detector={service.detector} device={service.device_name}"
+    )
     yield
 
 
-app = FastAPI(title="VOXY API")
+# IMPORTANT: register the lifespan handler so the AASIST service is actually
+# constructed before /api/health and /ws/analyze are used.
+app = FastAPI(title="VOXY API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[FRONTEND_ORIGIN, "http://localhost:3000"],
@@ -128,8 +134,6 @@ async def analyze_stream(websocket: WebSocket) -> None:
                     temporary.write(chunk)
                     temporary_path = temporary.name
 
-                # Inference is CPU-bound on Render, so keep it off the
-                # asyncio event loop while the WebSocket remains responsive.
                 timeline, quality = await asyncio.to_thread(
                     service.predict_file,
                     temporary_path,
@@ -139,10 +143,6 @@ async def analyze_stream(websocket: WebSocket) -> None:
                     print("VOXY live: segment contained insufficient usable audio")
                     continue
 
-                # A four-second segment should normally yield exactly one
-                # complete model window. If decoding produces more, only use
-                # the first score so each live segment corresponds to one point
-                # on the real-time graph.
                 score = float(timeline[0])
                 scores.append(score)
                 scores = scores[-MAX_WINDOWS:]
@@ -179,8 +179,6 @@ async def analyze_stream(websocket: WebSocket) -> None:
                 )
 
             except Exception as error:
-                # A bad/empty browser segment must not tear down the whole
-                # live connection. Log it and wait for the next segment.
                 print(f"VOXY live segment error: {error}")
                 continue
             finally:

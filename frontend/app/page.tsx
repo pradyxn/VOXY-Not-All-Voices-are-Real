@@ -87,6 +87,33 @@ export default function Home() {
 
   return (
     <main className={`vxy-shell theme-${theme}`}>
+      <style>{`
+        .vxy-shell{--theme-transition:background .35s ease,color .35s ease,border-color .35s ease;transition:var(--theme-transition)}
+        .vxy-shell.theme-dark{background:#050606;color:#f2f4ee}
+        .vxy-shell.theme-dark .vxy-frame{background:#0d0f0e;color:#f2f4ee}
+        .vxy-shell.theme-dark .vxy-nav{background:rgba(21,24,22,.76);border-color:rgba(255,255,255,.14)}
+        .vxy-shell.theme-dark .vxy-logo,.vxy-shell.theme-dark .vxy-title,.vxy-shell.theme-dark .hero-meta,.vxy-shell.theme-dark .hero-meta-left strong,.vxy-shell.theme-dark .meta-label{color:#f2f4ee}
+        .vxy-shell.theme-dark .vxy-nav-links button,.vxy-shell.theme-dark .hero-meta-right p,.vxy-shell.theme-dark .muted,.vxy-shell.theme-dark .kicker,.vxy-shell.theme-dark .split-section>p{color:#a8ada7}
+        .vxy-shell.theme-dark .vxy-nav-links button:hover{color:#fff}
+        .vxy-shell.theme-dark .vxy-pill.secondary,.vxy-shell.theme-dark .theme-toggle,.vxy-shell.theme-dark .pipeline-step,.vxy-shell.theme-dark .step-detail,.vxy-shell.theme-dark .upload-card,.vxy-shell.theme-dark .result-card,.vxy-shell.theme-dark .demo-row button,.vxy-shell.theme-dark .inline-note,.vxy-shell.theme-dark .verify-note,.vxy-shell.theme-dark .metrics>div,.vxy-shell.theme-dark .dropzone{background:#151816;color:#f2f4ee;border-color:rgba(255,255,255,.14)}
+        .vxy-shell.theme-dark .pipeline-step:hover,.vxy-shell.theme-dark .pipeline-step.active{background:#1b1e1c;border-color:#c6e93d}
+        .vxy-shell.theme-dark .step-detail p,.vxy-shell.theme-dark .model-message{color:#a8ada7}
+        .vxy-shell.theme-dark .dropzone strong,.vxy-shell.theme-dark .card-title h3,.vxy-shell.theme-dark .result-top h3{color:#f2f4ee}
+        .vxy-shell.theme-dark .dropzone:hover{background:#1b1e1c}
+        .vxy-shell.theme-dark .badge{background:#242824;color:#f2f4ee}
+        .vxy-shell.theme-dark .meter,.vxy-shell.theme-dark .vxy-progress-bar{background:#292d2a}
+        .vxy-shell.theme-dark .vxy-footer{border-color:rgba(255,255,255,.12)}
+        .vxy-shell.theme-dark .contact-email{color:#f2f4ee}
+        .theme-toggle{white-space:nowrap}
+        .vxy-shell .vxy-nav-links button,.vxy-shell .vxy-pill,.vxy-shell .theme-toggle,.vxy-shell .vxy-logo,.vxy-shell .demo-row button,.vxy-shell .text-action,.vxy-shell .contact-email{transition:transform .2s ease,color .2s ease,background .2s ease,border-color .2s ease}
+        @media (hover:hover) and (pointer:fine){
+          .vxy-shell .vxy-nav-links button:hover,.vxy-shell .text-action:hover,.vxy-shell .contact-email:hover{transform:scale(1.035) translateY(-1px)}
+          .vxy-shell .vxy-pill:hover,.vxy-shell .theme-toggle:hover{transform:scale(1.04) translateY(-2px)}
+          .vxy-shell .vxy-pill:active,.vxy-shell .theme-toggle:active{transform:scale(.98)}
+          .vxy-shell .demo-row button:hover{transform:scale(1.03) translateY(-1px)}
+        }
+        @media (prefers-reduced-motion:reduce){.vxy-shell .vxy-nav-links button,.vxy-shell .vxy-pill,.vxy-shell .theme-toggle,.vxy-shell .vxy-logo,.vxy-shell .demo-row button,.vxy-shell .text-action,.vxy-shell .contact-email{transition:none}}
+      `}</style>
       <div className="vxy-frame">
         <header className="vxy-header">
           <nav className="vxy-nav" aria-label="Main navigation">

@@ -2200,3 +2200,32 @@ body,
 [data-theme="dark"] .modal {
   background: var(--theme-card);
 }
+
+.detector-label {
+  margin-top: 9px !important;
+  color: var(--lime) !important;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.live-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #c6e93d;
+  box-shadow: 0 0 0 4px rgba(198, 233, 61, 0.16);
+  animation: livePulse 1.4s ease-in-out infinite;
+}
+
+@keyframes livePulse {
+  0%, 100% { opacity: 0.55; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1); }
+}

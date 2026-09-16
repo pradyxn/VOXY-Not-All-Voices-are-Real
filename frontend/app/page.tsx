@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, ArrowRight, Check, FileAudio, LockKeyhole, Mic, Moon, Play, ShieldCheck, Sun, Upload, Waves, X } from "lucide-react";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -13,6 +13,7 @@ type Result = {
   windows_analyzed: number;
   audio_quality: string;
   mode: string;
+  detector?: string;
   model_message?: string;
   timeline: number[];
 };
@@ -27,8 +28,8 @@ const pipelineSteps = [
   ["VOICE", "The recording enters the same path whether it comes from a file or a microphone."],
   ["PREPROCESSING", "Audio is converted to 16 kHz mono before analysis."],
   ["4-SECOND WINDOWS", "Consistent windows keep the signal comparable as the voice changes."],
-  ["MEL-SPECTROGRAM", "A 128-band Mel representation makes acoustic texture measurable."],
-  ["NEURAL NETWORK", "The PyTorch CNN evaluates patterns associated with synthetic speech."],
+  ["RAW WAVEFORM", "A fixed 16 kHz waveform window enters the anti-spoofing model."],
+  ["AASIST MODEL", "A pretrained graph-attention network evaluates bona fide and spoof cues."],
   ["AGGREGATION", "Multiple windows are combined into a 0-100 risk signal."],
 ];
 
@@ -40,8 +41,15 @@ export default function Home() {
   const [result, setResult] = useState<Result>(demoResults.uncertain);
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [busy, setBusy] = useState(false);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [modal, setModal] = useState<"login" | "contact" | null>(null);
   const [callOpen, setCallOpen] = useState(false);
+  const [liveActive, setLiveActive] = useState(false);
+  const [liveError, setLiveError] = useState<string | null>(null);
+  const [liveSeconds, setLiveSeconds] = useState(0);
+  const mediaRecorder = useRef<MediaRecorder | null>(null);
+  const mediaStream = useRef<MediaStream | null>(null);
+  const socket = useRef<WebSocket | null>(null);
   const [verification, setVerification] = useState(false);
   const [activeStep, setActiveStep] = useState(0);
 
@@ -54,6 +62,14 @@ export default function Home() {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem("voxy-theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    if (!liveActive) return;
+    const timer = window.setInterval(() => setLiveSeconds((seconds) => seconds + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, [liveActive]);
+
+  useEffect(() => () => stopLiveSimulation(), []);
 
   useEffect(() => {
     const items = document.querySelectorAll(".reveal");
@@ -74,6 +90,7 @@ export default function Home() {
   async function analyzeFile(file?: File) {
     if (!file) return;
     setBusy(true);
+    setAnalysisError(null);
     scrollToSection("analyze");
     try {
       const body = new FormData();
@@ -81,16 +98,69 @@ export default function Home() {
       const response = await fetch(`${API}/api/analyze`, { method: "POST", body });
       if (!response.ok) throw new Error("Backend unavailable");
       setResult(await response.json());
-    } catch {
-      setResult({ ...demoResults.uncertain, model_message: "SIMULATION - backend unavailable; showing safe demo state" });
+    } catch (error) {
+      setAnalysisError(error instanceof Error ? error.message : "Audio analysis failed.");
     } finally {
       setBusy(false);
     }
   }
 
   function chooseDemo(kind: keyof typeof demoResults) {
+    setAnalysisError(null);
     setResult(demoResults[kind]);
     scrollToSection("analyze");
+  }
+
+  function stopLiveSimulation() {
+    mediaRecorder.current?.stop();
+    mediaStream.current?.getTracks().forEach((track) => track.stop());
+    socket.current?.close();
+    mediaRecorder.current = null;
+    mediaStream.current = null;
+    socket.current = null;
+    setLiveActive(false);
+  }
+
+  async function startLiveSimulation() {
+    setLiveError(null);
+    setAnalysisError(null);
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      setLiveError("This browser does not support microphone recording.");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "";
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      const liveSocket = new WebSocket(`${API.replace(/^http/, "ws")}/ws/analyze`);
+      mediaStream.current = stream;
+      mediaRecorder.current = recorder;
+      socket.current = liveSocket;
+      liveSocket.onopen = () => {
+        setLiveSeconds(0);
+        setLiveActive(true);
+        recorder.start(1000);
+      };
+      liveSocket.onmessage = (event) => {
+        const update = JSON.parse(event.data) as Result;
+        setResult({ ...update, mode: "pretrained", model_message: "LIVE MODEL ANALYSIS - AASIST pretrained anti-spoofing model" });
+      };
+      liveSocket.onerror = () => {
+        setLiveError("The analysis server is unavailable.");
+        stopLiveSimulation();
+      };
+      liveSocket.onclose = () => {
+        mediaStream.current?.getTracks().forEach((track) => track.stop());
+        setLiveActive(false);
+      };
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0 && liveSocket.readyState === WebSocket.OPEN) liveSocket.send(event.data);
+      };
+      recorder.onerror = () => setLiveError("Microphone recording stopped unexpectedly.");
+    } catch (error) {
+      setLiveError(error instanceof DOMException && error.name === "NotAllowedError" ? "Microphone permission was denied." : "No usable microphone was found.");
+      stopLiveSimulation();
+    }
   }
 
   const title = busy ? "Analyzing..." : result.status === "suspicious" ? "Elevated signal" : result.status === "human" ? "Lower signal" : "Needs context";
@@ -150,7 +220,7 @@ export default function Home() {
           <div className="vxy-orb-scene" aria-label="Abstract VOXY acoustic analysis visual">
             <div className="vxy-acoustic-visual"><div className="acoustic-halo halo-one" /><div className="acoustic-halo halo-two" /><div className="acoustic-core"><i /><i /><i /><i /></div><div className="acoustic-ribbon ribbon-one" /><div className="acoustic-ribbon ribbon-two" /><div className="acoustic-ribbon ribbon-three" /><div className="acoustic-spark spark-one" /><div className="acoustic-spark spark-two" /></div>
           </div>
-          <div className="hero-meta hero-meta-left"><span className="meta-label">VOICE ANALYSIS</span><strong>16 kHz</strong><span>4s WINDOWS</span><span>128-BAND MEL</span></div>
+          <div className="hero-meta hero-meta-left"><span className="meta-label">VOICE ANALYSIS</span><strong>16 kHz</strong><span>4s WINDOWS</span><span>RAW WAVEFORM</span></div>
           <div className="hero-meta hero-meta-right"><div className="process-line"><span>VOICE INPUT</span><small>/01</small></div><div className="process-line"><span>SIGNAL ANALYSIS</span><small>/02</small></div><div className="process-line"><span>RISK AGGREGATION</span><small>/03</small></div><p>Turn acoustic evidence<br />into your next safe step.</p></div>
           <div className="vxy-cta-wrap"><button className="vxy-cta-bubble" onClick={() => scrollToSection("analyze")} aria-label="Analyze a voice"><Play size={14} fill="currentColor" /><span>Analyze<br />a voice</span></button></div>
         </section>
@@ -169,11 +239,11 @@ export default function Home() {
 
         <section className="vxy-section analyze-section reveal" id="analyze">
           <div className="section-heading"><div><span className="kicker">Live workspace</span><h2>Analyze a voice.</h2></div><p>Upload an audio clip or choose a labelled simulation. Demo values are never presented as genuine model predictions.</p></div>
-          <div className="analyze-layout"><div className="upload-card"><div className="card-title"><FileAudio size={20} /><h3>Voice input</h3></div><p className="muted">WAV, MP3, M4A, or browser WebM. Audio is processed temporarily.</p><label className="dropzone"><Upload size={27} /><strong>Choose a recording</strong><span>Send it to the VOXY pipeline</span><input type="file" accept="audio/*" onChange={(event) => analyzeFile(event.target.files?.[0])} /></label><div className="demo-row"><button onClick={() => chooseDemo("human")}>Human / demo</button><button onClick={() => chooseDemo("synthetic")}>Synthetic / demo</button><button onClick={() => chooseDemo("uncertain")}>Uncertain / demo</button></div><button className="text-action" onClick={() => setCallOpen(!callOpen)}><Mic size={16} /> {callOpen ? "Close realtime simulation" : "Open realtime call simulation"}</button>{callOpen && <div className="inline-note"><strong>Realtime Call Simulation</strong><p>A browser can analyze microphone input, but cannot intercept arbitrary cellular calls.</p><button className="vxy-pill primary" onClick={() => setCallOpen(false)}>Start simulated call</button></div>}</div>
-            <div className="result-card" aria-live="polite"><div className="result-top"><div><span className="kicker">Voice assessment</span><h3>{title}</h3></div><span className="badge">{result.mode === "demo" ? "SIMULATION" : result.risk_level}</span></div><div className="score">{Math.round(result.synthetic_score)}<span>/100</span></div><p className="muted">synthetic likelihood · model score, not a calibrated probability</p><div className="meter"><i style={{ width: `${result.synthetic_score}%` }} /></div><div className="metrics"><div><small>Risk score</small><strong>{result.risk_score}</strong></div><div><small>Risk level</small><strong>{result.risk_level}</strong></div><div><small>Windows</small><strong>{result.windows_analyzed}</strong></div></div><div className="timeline-bars">{result.timeline.map((score, index) => <div key={index} style={{ height: `${Math.max(score, 8)}%` }} title={`Window ${index + 1}: ${score}`} />)}</div>{result.risk_score >= 60 && <div className="verify-note"><strong>Verify before taking action.</strong><p>Ask a trusted question, contact the person through another channel, and do not share OTPs or transfer money based on the call alone.</p><button className="vxy-pill primary" onClick={() => setVerification(!verification)}>{verification ? <><Check size={15} /> Steps shown</> : "Verify caller"}</button>{verification && <p><Check size={15} /> End the call, use a trusted contact method, and independently confirm identity.</p>}</div>}<p className="model-message">{result.model_message}</p></div></div>
+          <div className="analyze-layout"><div className="upload-card"><div className="card-title"><FileAudio size={20} /><h3>Voice input</h3></div><p className="muted">WAV, MP3, M4A, or browser WebM. Audio is processed temporarily.</p><label className="dropzone"><Upload size={27} /><strong>Choose a recording</strong><span>Send it to the VOXY pipeline</span><input type="file" accept="audio/*" onChange={(event) => analyzeFile(event.target.files?.[0])} /></label><div className="demo-row"><button onClick={() => chooseDemo("human")}>Human / demo</button><button onClick={() => chooseDemo("synthetic")}>Synthetic / demo</button><button onClick={() => chooseDemo("uncertain")}>Uncertain / demo</button></div><button className="text-action" onClick={() => { if (liveActive) stopLiveSimulation(); else setCallOpen(!callOpen); }}><Mic size={16} /> {liveActive ? "Stop microphone simulation" : callOpen ? "Close microphone simulation" : "Open microphone simulation"}</button>{callOpen && <div className="inline-note"><strong>Browser Microphone Simulation</strong><p>Audio is streamed to VOXY for live AASIST analysis. It does not intercept cellular calls.</p>{liveActive ? <p className="live-status"><span className="live-dot" /> Listening · {liveSeconds}s</p> : <button className="vxy-pill primary" onClick={startLiveSimulation}>Start microphone analysis</button>}{liveError && <p role="alert">{liveError}</p>}</div>}</div>
+            <div className="result-card" aria-live="polite"><div className="result-top"><div><span className="kicker">Voice assessment</span><h3>{title}</h3></div><span className="badge">{result.mode === "demo" ? "SIMULATION" : result.risk_level}</span></div><div className="score">{Math.round(result.synthetic_score)}<span>/100</span></div><p className="muted">synthetic likelihood · model score, not a calibrated probability</p>{result.detector && result.mode !== "demo" && <p className="detector-label">{result.detector}</p>}<div className="meter"><i style={{ width: `${result.synthetic_score}%` }} /></div><div className="metrics"><div><small>Risk score</small><strong>{result.risk_score}</strong></div><div><small>Risk level</small><strong>{result.risk_level}</strong></div><div><small>Windows</small><strong>{result.windows_analyzed}</strong></div></div><div className="timeline-bars">{result.timeline.map((score, index) => <div key={index} style={{ height: `${Math.max(score, 8)}%` }} title={`Window ${index + 1}: ${score}`} />)}</div>{result.risk_score >= 60 && <div className="verify-note"><strong>Verify before taking action.</strong><p>Ask a trusted question, contact the person through another channel, and do not share OTPs or transfer money based on the call alone.</p><button className="vxy-pill primary" onClick={() => setVerification(!verification)}>{verification ? <><Check size={15} /> Steps shown</> : "Verify caller"}</button>{verification && <p><Check size={15} /> End the call, use a trusted contact method, and independently confirm identity.</p>}</div>}<p className="model-message">{analysisError || result.model_message}</p></div></div>
         </section>
 
-        <section className="vxy-section split-section reveal" id="insights"><div><span className="kicker">HOW VOXY WORKS</span><h2>From voice<br />to risk signal.</h2></div><p>Audio enters VOXY as a short voice sample. We normalize it to 16 kHz, split it into 4-second windows, convert each window into a Mel-spectrogram, and analyze it with our neural network. Results are aggregated across the recording to produce a 0–100 voice-risk score.</p></section>
+        <section className="vxy-section split-section reveal" id="insights"><div><span className="kicker">HOW VOXY WORKS</span><h2>From voice<br />to risk signal.</h2></div><p>Audio enters VOXY as a short voice sample. We normalize it to 16 kHz, split it into overlapping 4-second windows, and analyze each raw waveform with the pretrained AASIST anti-spoofing model. Results are aggregated across the recording to produce a 0–100 spoof-risk score.</p></section>
 
         <footer className="vxy-footer"><span>VOXY · Not All Voices Are Real.</span><span><LockKeyhole size={14} /> Audio is processed for analysis and not intentionally retained.</span></footer>
       </div>

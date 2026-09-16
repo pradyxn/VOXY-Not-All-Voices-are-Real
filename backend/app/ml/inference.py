@@ -1,44 +1,69 @@
 from pathlib import Path
+import numpy as np
 import torch
-from .model import VoiceCNN
-from .preprocessing import create_model_tensor, load_audio, quality_check
-from .aggregation import aggregate_scores
-from ..config import MODEL_PATH
+from .preprocessing import load_audio, quality_check, split_windows
+from ..config import MAX_WINDOWS, MODEL_PATH, SAMPLE_RATE, TARGET_SAMPLES
 
 class InferenceService:
     def __init__(self) -> None:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = VoiceCNN().to(self.device)
+        self.session = None
+        self.providers: list[str] = []
         self.loaded = False
-        self.mode = "demo"
-        if MODEL_PATH.exists():
-            checkpoint = torch.load(MODEL_PATH, map_location=self.device)
-            state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-            self.model.load_state_dict(state_dict, strict=True)
-            self.model.eval()
+        self.mode = "pretrained"
+        self.detector = "AASIST pretrained anti-spoofing model"
+        if not MODEL_PATH.exists():
+            raise FileNotFoundError(f"AASIST checkpoint missing: {MODEL_PATH}. Run setup_model.py first.")
+        try:
+            import onnxruntime as ort
+            available = ort.get_available_providers()
+            preferred = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            self.providers = [provider for provider in preferred if provider in available]
+            if not self.providers:
+                raise RuntimeError("ONNX Runtime has no usable execution provider")
+            self.session = ort.InferenceSession(str(MODEL_PATH), providers=self.providers)
+            input_shape = self.session.get_inputs()[0].shape
+            if input_shape[-1] != TARGET_SAMPLES:
+                raise RuntimeError(f"Unexpected AASIST input shape: {input_shape}")
             self.loaded = True
-            self.mode = "ml"
+        except ImportError as error:
+            raise RuntimeError("onnxruntime is required for AASIST inference") from error
 
     def predict_file(self, path: str | Path) -> tuple[list[float], str]:
         audio, _ = load_audio(path)
+        return self.predict_audio(audio)
+
+    def predict_audio(self, audio: np.ndarray) -> tuple[list[float], str]:
         quality = quality_check(audio)
         if quality == "insufficient":
             return [], quality
-        windows = [audio[start:start + 64_000] for start in range(0, max(1, len(audio) - 1), 64_000)]
-        scores = []
-        for window in windows[:8]:
-            if self.loaded:
-                with torch.inference_mode():
-                    logits = self.model(create_model_tensor(window).to(self.device))
-                    scores.append(float(torch.softmax(logits, dim=1)[0, 1].item() * 100))
-            else:
-                # Deterministic fallback is deliberately marked as demo mode by the API.
-                energy = float(torch.tensor(window).abs().mean())
-                scores.append(round(38 + min(54, energy * 1000), 1))
-        return scores or [50.0], quality
+        windows = split_windows(audio)[:MAX_WINDOWS]
+        return [self.predict_window(window) for window in windows], quality
 
-    def predict_tensor(self, tensor: torch.Tensor) -> float:
-        if not self.loaded:
-            return 50.0
+    def predict_window(self, audio: np.ndarray) -> float:
+        _, _, spoof_score = self.predict_window_details(audio)
+        return spoof_score
+
+    def predict_window_details(self, audio: np.ndarray) -> tuple[float, float, float]:
+        if not self.loaded or self.session is None:
+            raise RuntimeError("AASIST detector is not loaded")
+        waveform = np.asarray(pad_waveform(audio), dtype=np.float32)[None, :]
         with torch.inference_mode():
-            return float(torch.softmax(self.model(tensor.to(self.device)), dim=1)[0, 1].item() * 100)
+            logits = self.session.run(None, {self.session.get_inputs()[0].name: waveform})[0]
+            bona_fide_logit = float(logits[0, 0])
+            spoof_logit = float(logits[0, 1])
+            spoof_score = 1.0 / (1.0 + np.exp(bona_fide_logit - spoof_logit))
+        return bona_fide_logit, spoof_logit, round(float(spoof_score * 100), 1)
+
+    @property
+    def provider(self) -> str:
+        return self.providers[0] if self.providers else "unavailable"
+
+    @property
+    def device_name(self) -> str:
+        return "CUDA" if self.provider == "CUDAExecutionProvider" else "CPU"
+
+def pad_waveform(audio: np.ndarray) -> np.ndarray:
+    if len(audio) >= TARGET_SAMPLES:
+        return audio[:TARGET_SAMPLES]
+    return np.pad(audio, (0, TARGET_SAMPLES - len(audio)))

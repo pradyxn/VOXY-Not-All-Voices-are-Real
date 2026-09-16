@@ -1,31 +1,15 @@
 {
-  "model_architecture": "VoiceCNN",
+  "model_architecture": "AASIST",
   "class_mapping": {
-    "bonafide": 0,
-    "spoof": 1
+    "bonafide_logit": 0,
+    "spoof_logit": 1
   },
   "sample_rate": 16000,
-  "target_samples": 64000,
-  "mel_bins": 128,
-  "train_sample_counts": {
-    "bonafide": 8,
-    "spoof": 8
-  },
-  "dev_sample_counts": {
-    "bonafide": 8,
-    "spoof": 8
-  },
-  "epochs": 1,
-  "batch_size": 8,
-  "learning_rate": 0.0001,
-  "best_validation_metrics": {
-    "loss": 1.038926362991333,
-    "accuracy": 0.5,
-    "precision": 0.0,
-    "recall": 0.0,
-    "f1": 0.0
-  },
-  "device": "cuda",
-  "smoke_test": true,
-  "seed": 42
+  "target_samples": 64600,
+  "window_hop_samples": 32300,
+  "input": "raw float32 mono waveform",
+  "checkpoint": "https://huggingface.co/SpeechAntiSpoofingBenchmarks/AASIST/resolve/main/aasist.onnx",
+  "score_direction": "AASIST logits favor bona fide at logit 0; VOXY uses sigmoid(spoof_logit - bonafide_logit) * 100",
+  "pretrained": true,
+  "smoke_test": false
 }

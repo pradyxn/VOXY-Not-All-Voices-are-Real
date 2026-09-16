@@ -1,11 +1,12 @@
 from contextlib import asynccontextmanager
+import asyncio
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from .config import FRONTEND_ORIGIN
+from .config import FRONTEND_ORIGIN, MAX_WINDOWS, SAMPLE_RATE, TARGET_SAMPLES
 from .schemas import AnalysisResponse, HealthResponse
 from .ml.inference import InferenceService
 from .ml.aggregation import aggregate_scores
@@ -28,7 +29,7 @@ app.add_middleware(CORSMiddleware, allow_origins=[FRONTEND_ORIGIN, "http://local
 @app.get("/api/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     assert service is not None
-    return HealthResponse(status="ok", model_loaded=service.loaded, mode=service.mode, device=str(service.device).upper(), ffmpeg_available=ffmpeg_available())
+    return HealthResponse(status="ok", model_loaded=service.loaded, detector=service.detector, mode=service.mode, device=service.device_name, ffmpeg_available=ffmpeg_available())
 
 @app.post("/api/analyze", response_model=AnalysisResponse)
 async def analyze(audio: UploadFile = File(...)) -> AnalysisResponse:
@@ -46,7 +47,7 @@ async def analyze(audio: UploadFile = File(...)) -> AnalysisResponse:
         timeline, quality = service.predict_file(temporary_path)
         aggregate, stability, windows = aggregate_scores(timeline)
         risk, level = calculate_risk(aggregate, windows, stability, quality)
-        return AnalysisResponse(status="suspicious" if aggregate >= 60 else "human" if aggregate < 35 else "uncertain", synthetic_score=aggregate, risk_score=risk, risk_level=level, windows_analyzed=windows, audio_quality=quality, mode=service.mode, model_message=None if service.loaded else "ML model unavailable - running demonstration mode.", timeline=timeline)
+        return AnalysisResponse(status="suspicious" if aggregate >= 60 else "human" if aggregate < 35 else "uncertain", synthetic_score=aggregate, risk_score=risk, risk_level=level, windows_analyzed=windows, audio_quality=quality, mode=service.mode, detector=service.detector, model_message="AASIST score converted from bona-fide-vs-spoof logits; not a calibrated probability.", timeline=timeline)
     except Exception as error:
         raise HTTPException(422, f"Audio analysis failed: {error}") from error
     finally:
@@ -56,16 +57,38 @@ async def analyze(audio: UploadFile = File(...)) -> AnalysisResponse:
 @app.websocket("/ws/analyze")
 async def analyze_stream(websocket: WebSocket) -> None:
     await websocket.accept()
-    window_id = 0
+    if service is None or not service.loaded:
+        await websocket.close(code=1011, reason="AASIST detector is unavailable")
+        return
+    audio_buffer = bytearray()
+    analyzed_windows = 0
     scores: list[float] = []
     try:
         while True:
-            message = await websocket.receive_bytes()
-            window_id += 1
-            score = 50.0 if not message else min(96.0, 44.0 + (sum(message[:200]) % 4800) / 100)
-            scores.append(score)
-            aggregate, stability, windows = aggregate_scores(scores[-8:])
-            risk, level = calculate_risk(aggregate, windows, stability, "good")
-            await websocket.send_json({"window_id": window_id, "synthetic_score": aggregate, "risk_score": risk, "status": level.lower(), "mode": service.mode if service else "demo"})
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                return
+            if message.get("text") == "stop":
+                return
+            chunk = message.get("bytes")
+            if not chunk:
+                continue
+            audio_buffer.extend(chunk)
+            if len(audio_buffer) < 16_000 or analyzed_windows >= MAX_WINDOWS:
+                continue
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temporary:
+                temporary.write(audio_buffer)
+                temporary_path = temporary.name
+            try:
+                timeline, quality = await asyncio.to_thread(service.predict_file, temporary_path)
+            finally:
+                Path(temporary_path).unlink(missing_ok=True)
+            new_scores = timeline[analyzed_windows:]
+            for score in new_scores:
+                scores.append(score)
+                analyzed_windows += 1
+                aggregate, stability, windows = aggregate_scores(scores[-MAX_WINDOWS:])
+                risk, level = calculate_risk(aggregate, windows, stability, quality)
+                await websocket.send_json({"window_id": analyzed_windows, "synthetic_score": aggregate, "risk_score": risk, "risk_level": level, "status": "suspicious" if aggregate >= 60 else "human" if aggregate < 35 else "uncertain", "stability": stability, "audio_quality": quality, "windows_analyzed": windows, "mode": service.mode, "detector": service.detector, "timeline": scores[-MAX_WINDOWS:]})
     except WebSocketDisconnect:
         return

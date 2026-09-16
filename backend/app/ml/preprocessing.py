@@ -1,12 +1,19 @@
 from pathlib import Path
+import subprocess
 import librosa
 import numpy as np
 import torch
-from ..config import SAMPLE_RATE, TARGET_SAMPLES
+from ..config import SAMPLE_RATE, TARGET_SAMPLES, WINDOW_HOP_SAMPLES
 
 def load_audio(path: str | Path) -> tuple[np.ndarray, int]:
-    audio, rate = librosa.load(str(path), sr=SAMPLE_RATE, mono=False)
-    return convert_to_mono(audio), rate
+    try:
+        audio, rate = librosa.load(str(path), sr=SAMPLE_RATE, mono=False)
+    except Exception:
+        command = ["ffmpeg", "-v", "error", "-i", str(path), "-f", "f32le", "-ac", "1", "-ar", str(SAMPLE_RATE), "-"]
+        decoded = subprocess.run(command, check=True, capture_output=True).stdout
+        audio = np.frombuffer(decoded, dtype=np.float32)
+        rate = SAMPLE_RATE
+    return convert_to_mono(np.asarray(audio, dtype=np.float32)), rate
 
 def convert_to_mono(audio: np.ndarray) -> np.ndarray:
     return audio.mean(axis=0) if audio.ndim > 1 else audio
@@ -20,6 +27,15 @@ def pad_or_trim(audio: np.ndarray, target_samples: int = TARGET_SAMPLES) -> np.n
     if len(audio) >= target_samples:
         return audio[:target_samples]
     return np.pad(audio, (0, target_samples - len(audio)))
+
+def split_windows(audio: np.ndarray) -> list[np.ndarray]:
+    if len(audio) <= TARGET_SAMPLES:
+        return [pad_or_trim(audio)]
+    starts = list(range(0, len(audio) - TARGET_SAMPLES + 1, WINDOW_HOP_SAMPLES))
+    windows = [audio[start:start + TARGET_SAMPLES] for start in starts]
+    if starts[-1] + TARGET_SAMPLES < len(audio):
+        windows.append(audio[-TARGET_SAMPLES:])
+    return windows
 
 def create_mel_spectrogram(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
     return librosa.feature.melspectrogram(y=audio, sr=sample_rate, n_mels=128, power=2.0)

@@ -4,6 +4,8 @@ if not exist ".venv\Scripts\python.exe" python -m venv ".venv"
 call ".venv\Scripts\activate.bat"
 python -m pip install -r "requirements.txt"
 if not exist "..\models" mkdir "..\models"
+python "..\setup_model.py"
+if errorlevel 1 exit /b 1
 where ffmpeg >nul 2>nul
 if errorlevel 1 (
   echo ERROR: ffmpeg is required and was not found on PATH.

@@ -2,7 +2,7 @@
 
 ## Not All Voices Are Real.
 
-VOXY is an AI voice-security prototype for analyzing acoustic signals associated with synthetic or cloned speech. It accepts an audio recording, processes it through a consistent signal pipeline, evaluates the resulting Mel-spectrogram with a PyTorch CNN, aggregates evidence across multiple windows, and presents a 0-100 risk signal with practical verification guidance.
+VOXY is an AI voice-security prototype for analyzing acoustic signals associated with synthetic or cloned speech. It accepts an audio recording, normalizes it to 16 kHz mono, evaluates overlapping raw-waveform windows with the pretrained AASIST anti-spoofing model, aggregates evidence across windows, and presents a 0-100 risk signal with practical verification guidance.
 
 VOXY is decision support, not an infallible detector. It does not guarantee that a voice is real or fake, identify the caller, or replace independent verification.
 
@@ -13,11 +13,11 @@ The repository currently contains:
 - A working Next.js frontend with the VOXY product experience and analysis workspace.
 - A FastAPI backend with REST and WebSocket endpoints.
 - Shared preprocessing, model inference, temporal aggregation, and risk-engine layers.
-- An ASVspoof 2019 LA training script that uses the same model and preprocessing path as inference.
-- A generated compatible checkpoint at `models/model_final.pth`.
-- A metadata file at `models/model_metadata.json`.
+- A pretrained AASIST ONNX detector downloaded by `setup_model.py`.
+- Real upload and browser microphone WebSocket inference paths.
+- A metadata file at `models/model_metadata.json` describing score direction and preprocessing.
 
-The checked-in checkpoint was produced by the deterministic smoke-test path. It proves that dataset parsing, audio loading, spectrogram creation, model forward/backward passes, checkpoint saving, and inference loading work end to end. It must not be treated as a production-quality accuracy result. The current metadata records 16 train samples, 16 dev samples, one epoch, and validation F1 of `0.0`.
+`models/model_final.pth` is retained only as an archived smoke-test artifact and is no longer loaded by production inference. It must not be treated as a production-quality accuracy result.
 
 ## Repository Layout
 
@@ -29,8 +29,8 @@ The checked-in checkpoint was produced by the deterministic smoke-test path. It 
 |   |   |-- config.py               Shared sample/window/model configuration
 |   |   |-- schemas.py              API response models
 |   |   |-- ml/
-|   |   |   |-- model.py             VoiceCNN architecture
-|   |   |   |-- preprocessing.py     Audio and Mel-spectrogram pipeline
+|   |   |   |-- model.py             Archived smoke-test architecture (unused)
+|   |   |   |-- preprocessing.py     Raw waveform/audio decoding pipeline
 |   |   |   |-- inference.py         File inference service
 |   |   |   |-- aggregation.py       Rolling score aggregation
 |   |   |-- risk/
@@ -47,8 +47,9 @@ The checked-in checkpoint was produced by the deterministic smoke-test path. It 
 |   |-- package.json
 |   |-- .env.local                   Frontend API URL
 |-- models/
-|   |-- model_final.pth              Compatible VoiceCNN checkpoint
-|   |-- model_metadata.json          Checkpoint and training metadata
+|   |-- AASIST.onnx                 Downloaded pretrained AASIST artifact (not committed)
+|   |-- model_final.pth              Archived smoke-test checkpoint, unused in production
+|   |-- model_metadata.json          AASIST checkpoint and score metadata
 |-- scripts/
 |   |-- train.py                     ASVspoof LA training and smoke-test script
 |   |-- test_model.py                Model tensor/output smoke check
@@ -75,10 +76,10 @@ Temporary server-side audio file
 4-second / 64,000-sample windows
         |
         v
-128-band Mel-spectrogram -> power-to-dB conversion
+Raw float32 waveform, padded/truncated to 64,600 samples
         |
         v
-VoiceCNN neural-network inference
+AASIST pretrained anti-spoofing inference
         |
         v
 Window scores -> rolling/EMA aggregation
@@ -90,7 +91,7 @@ Window scores -> rolling/EMA aggregation
 Risk score, risk level, timeline, and verification guidance
 ```
 
-The same `VoiceCNN` and preprocessing functions are imported by both the training script and the backend inference service. This keeps the training and inference tensor contracts aligned.
+The production inference service uses the self-contained AASIST ONNX artifact. The legacy VoiceCNN training path remains only as historical smoke-test code and is not used by the API.
 
 ## Frontend
 
@@ -167,7 +168,8 @@ The response contains:
   "risk_level": "LOW | MODERATE | HIGH | CRITICAL",
   "windows_analyzed": 0,
   "audio_quality": "good | clipped | insufficient",
-  "mode": "ml | demo",
+        "mode": "pretrained | demo",
+        "detector": "AASIST pretrained anti-spoofing model",
   "model_message": null,
   "timeline": []
 }
@@ -181,7 +183,7 @@ Uploaded files are written to a temporary path for analysis and removed in the b
 WebSocket /ws/analyze
 ```
 
-The client can send audio bytes over the WebSocket. The backend returns incremental window, synthetic-score, risk-score, status, and mode values. In the browser product, realtime analysis is presented honestly as a simulation because a normal browser cannot intercept arbitrary cellular-call audio.
+The browser microphone simulation sends WebM/Opus chunks over the WebSocket. The backend buffers and decodes them, runs AASIST after enough audio is available, and returns incremental real model scores. A normal browser cannot intercept arbitrary cellular-call audio.
 
 ## Backend and ML Configuration
 
@@ -190,19 +192,21 @@ The shared configuration in `backend/app/config.py` defines:
 | Setting | Value | Purpose |
 |---|---:|---|
 | Sample rate | 16,000 Hz | Target audio rate |
-| Target samples | 64,000 | Four seconds at 16 kHz |
-| Window length | 4 seconds | Per-window analysis duration |
-| Minimum windows | 3 | Aggregation configuration |
-| EMA alpha | 0.35 | Rolling score aggregation |
+| Target samples | 64,600 | AASIST model input |
+| Window hop | 32,300 | 50% overlap |
+| Maximum windows | 8 | Upload/live workload bound |
+| Aggregation | Median | Robust temporal score |
 
-The `VoiceCNN` uses two output classes:
+The AASIST ONNX model returns two logits:
 
 ```text
-bonafide -> 0
-spoof    -> 1
+bonafide -> logit 0
+spoof    -> logit 1
+
+The published AASIST convention is higher bona fide. VOXY explicitly converts the logits with `sigmoid(spoof_logit - bonafide_logit) * 100`, so higher VOXY scores indicate more model-indicated spoof risk. This is a score, not a calibrated probability.
 ```
 
-The inference service loads `models/model_final.pth` when it exists and matches the architecture exactly. If no compatible checkpoint is available, the backend remains usable in clearly labelled demo mode. Demo values must not be presented as real model predictions.
+The inference service loads `models/AASIST.onnx` once when FastAPI starts. If it is missing or cannot load, startup fails clearly; the upload endpoint never substitutes fabricated scores. Demo values remain frontend-only and are explicitly labelled.
 
 Prototype risk bands are:
 
@@ -240,7 +244,7 @@ Prerequisites:
 - Python 3.11 or a compatible Python version supported by the pinned packages.
 - Node.js and npm.
 - FFmpeg available on `PATH`.
-- NVIDIA CUDA support is optional. PyTorch automatically selects CUDA when available and otherwise uses CPU.
+- NVIDIA CUDA support is optional. The detector selects ONNX Runtime CUDA when available and otherwise uses CPU.
 
 FFmpeg is important because browser `MediaRecorder` commonly produces WebM/Opus audio that needs server-side decoding.
 
@@ -260,7 +264,12 @@ cd /d "C:\Users\prady\Documents\Omniroute\Projects\Voxy-Not All Voices are Real\
 python -m venv .venv
 call ".venv\Scripts\activate.bat"
 python -m pip install -r requirements.txt
+
+cd ..
+python setup_model.py
 ```
+
+`setup_model.py` downloads the official maintained AASIST checkpoint from Hugging Face and verifies its `[batch, 64600] -> [batch, 2]` inference contract. The model is ignored by Git and must be downloaded on each new machine.
 
 ### Frontend setup
 
@@ -312,14 +321,14 @@ npm run build
 npm run start
 ```
 
-## Training
+## Legacy Training
 
-The training script uses the real ASVspoof LA train and dev protocols and writes:
+The old training script uses the ASVspoof LA train and dev protocols and writes the archived smoke-test VoiceCNN files. It is not part of production inference and should not be used to claim detector quality.
 
 - `models/model_final.pth`
 - `models/model_metadata.json`
 
-Run a deterministic smoke test first:
+Run the legacy integration smoke test only when maintaining that historical path:
 
 ```bat
 cd /d "C:\Users\prady\Documents\Omniroute\Projects\Voxy-Not All Voices are Real"
@@ -352,11 +361,13 @@ The best checkpoint is selected by dev F1. Always review the full dev metrics an
 
 ## Verification and Tests
 
-Model tensor and output check:
+Pretrained AASIST detector check:
 
 ```bat
-python scripts\test_model.py
+python backend\scripts\test_detector.py
 ```
+
+This prints real model-derived scores for any audio files placed under `sample_audio\human` and `sample_audio\synthetic`, plus a zero-waveform load/inference check. No expected score is hardcoded.
 
 Audio-quality and risk-threshold check:
 
@@ -373,12 +384,13 @@ npm run build
 
 Manual integration checks should include:
 
-1. `GET /api/health` returns `status: ok`.
+1. `GET /api/health` returns `status: ok`, `model_loaded: true`, `detector: AASIST`, and `device: CPU` or `CUDA`.
 2. The homepage opens on port 3000.
 3. A labelled demo changes the result card.
-4. A supported audio upload returns the documented response fields.
+4. A supported audio upload returns real AASIST-derived scores and `mode: pretrained`.
 5. The `Analyze a voice` CTA reaches the existing workspace.
 6. The Contact modal uses `mailto:pradyun.marukala@gmail.com`.
+7. Open microphone simulation, grant permission, and confirm live windows update the result card.
 
 ## Troubleshooting
 
@@ -393,9 +405,9 @@ Remove-Item -Recurse -Force .next
 npm run dev -- --port 3000
 ```
 
-### Backend reports demo mode
+### Backend reports a missing detector
 
-Check that `models/model_final.pth` exists and matches the current `VoiceCNN` architecture. The API intentionally reports `mode: demo` when the model is unavailable or no compatible checkpoint is loaded.
+Run `python setup_model.py` from the repository root. The API fails clearly when the AASIST checkpoint cannot be loaded; it does not substitute fake scores.
 
 ### Browser audio upload fails
 
@@ -406,6 +418,17 @@ Check that:
 - The backend is running on port 8000.
 - `frontend/.env.local` points to the correct backend origin.
 - The backend CORS configuration allows the frontend origin.
+
+### Verify CUDA selection
+
+Run:
+
+```bat
+python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+curl http://localhost:8000/api/health
+```
+
+Health reports `CUDA` only when `CUDAExecutionProvider` is available and selected. Otherwise it honestly reports `CPU`; install a compatible NVIDIA driver/CUDA/cuDNN runtime and the `onnxruntime-gpu` requirement before expecting GPU execution.
 
 ### Audio is marked insufficient
 

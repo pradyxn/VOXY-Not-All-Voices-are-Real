@@ -10,13 +10,15 @@ class AnalysisResponse(BaseModel):
     risk_level: RiskLevel
     windows_analyzed: int
     audio_quality: str
-    mode: Literal["ml", "demo"]
+    mode: Literal["pretrained", "demo"]
+    detector: str = "AASIST pretrained anti-spoofing model"
     model_message: str | None = None
     timeline: list[float] = []
 
 class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
-    mode: Literal["ml", "demo"]
+    mode: Literal["pretrained", "demo"]
+    detector: str
     device: str
     ffmpeg_available: bool

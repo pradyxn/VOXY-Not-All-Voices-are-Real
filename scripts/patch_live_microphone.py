@@ -1,0 +1,184 @@
+from pathlib import Path
+
+path = Path("frontend/app/page.tsx")
+text = path.read_text(encoding="utf-8")
+
+old_ref = '  const intentionalStop = useRef(false);\n'
+new_ref = '  const intentionalStop = useRef(false);\n  const stopSegments = useRef<(() => void) | null>(null);\n'
+if 'const stopSegments = useRef' not in text:
+    if old_ref not in text:
+        raise SystemExit("Could not find live recorder refs")
+    text = text.replace(old_ref, new_ref, 1)
+
+start = text.index('  function stopLiveSimulation(')
+end = text.index('\n\n  const title =', start)
+
+new_block = '''  function stopLiveSimulation(silent = false) {
+    intentionalStop.current = silent;
+    stopSegments.current?.();
+    stopSegments.current = null;
+    if (mediaRecorder.current && mediaRecorder.current.state !== "inactive") mediaRecorder.current.stop();
+    mediaStream.current?.getTracks().forEach((track) => track.stop());
+    socket.current?.close(1000, "client stopped");
+    mediaRecorder.current = null;
+    mediaStream.current = null;
+    socket.current = null;
+    setLiveActive(false);
+  }
+
+  async function startLiveSimulation() {
+    setLiveError(null);
+    setAnalysisError(null);
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      setLiveError("This browser does not support microphone recording.");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : "";
+      const webSocketUrl = getWebSocketUrl(API, window.location.protocol);
+      logWebSocket("attempting connection", webSocketUrl);
+      const liveSocket = new WebSocket(webSocketUrl);
+
+      mediaStream.current = stream;
+      socket.current = liveSocket;
+      intentionalStop.current = false;
+
+      liveSocket.onopen = () => {
+        logWebSocket("onopen");
+        setLiveSeconds(0);
+        setLiveActive(true);
+
+        // Send complete, independently decodable WebM segments. Sending
+        // MediaRecorder timeslice fragments caused incomplete WebM containers
+        // to reach the backend and fail during decoding.
+        let segmentRecorder: MediaRecorder | null = null;
+        let stopped = false;
+
+        const recordSegment = () => {
+          if (stopped || liveSocket.readyState !== WebSocket.OPEN) return;
+
+          const chunks: Blob[] = [];
+          const nextRecorder = mimeType
+            ? new MediaRecorder(stream, { mimeType })
+            : new MediaRecorder(stream);
+          segmentRecorder = nextRecorder;
+
+          nextRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) chunks.push(event.data);
+          };
+
+          nextRecorder.onerror = () => {
+            setLiveError("Microphone recording stopped unexpectedly.");
+          };
+
+          nextRecorder.onstop = () => {
+            if (stopped) return;
+            const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
+            if (blob.size > 0 && liveSocket.readyState === WebSocket.OPEN) {
+              logWebSocket("sending complete segment", { bytes: blob.size });
+              liveSocket.send(blob);
+            }
+            window.setTimeout(recordSegment, 25);
+          };
+
+          nextRecorder.start();
+          window.setTimeout(() => {
+            if (nextRecorder.state === "recording") nextRecorder.stop();
+          }, 4000);
+        };
+
+        stopSegments.current = () => {
+          stopped = true;
+          if (segmentRecorder && segmentRecorder.state !== "inactive") segmentRecorder.stop();
+        };
+
+        recordSegment();
+      };
+
+      liveSocket.onmessage = (event) => {
+        try {
+          if (typeof event.data !== "string") return;
+          const update = JSON.parse(event.data) as Result;
+          logWebSocket("onmessage", update);
+          setResult({
+            ...update,
+            mode: "pretrained",
+            model_message: "LIVE MODEL ANALYSIS - AASIST pretrained anti-spoofing model",
+          });
+        } catch (error) {
+          logWebSocket("invalid server message", error);
+        }
+      };
+
+      liveSocket.onerror = () => {
+        logWebSocket("onerror", "Network error or connection refused");
+      };
+
+      liveSocket.onclose = (event) => {
+        logWebSocket("onclose", { code: event.code, reason: event.reason });
+        stopSegments.current?.();
+        stopSegments.current = null;
+        if (intentionalStop.current || event.code === 1000) {
+          setLiveError(null);
+        } else if (event.code === 1011 && event.reason.toLowerCase().includes("detector")) {
+          setLiveError("Backend closed the connection because the AASIST detector is unavailable.");
+        } else if (event.code === 1006) {
+          setLiveError("WebSocket connection refused or interrupted. Check that the backend is running and reachable.");
+        } else if (event.reason) {
+          setLiveError(`Backend closed the live connection (${event.code}): ${event.reason}`);
+        } else {
+          setLiveError(`Live connection closed unexpectedly (code ${event.code}).`);
+        }
+        mediaStream.current?.getTracks().forEach((track) => track.stop());
+        setLiveActive(false);
+      };
+    } catch (error) {
+      setLiveError(
+        error instanceof DOMException && error.name === "NotAllowedError"
+          ? "Microphone permission was denied."
+          : error instanceof Error
+            ? error.message
+            : "Unable to start microphone analysis.",
+      );
+      stopLiveSimulation();
+    }
+  }'''
+
+text = text[:start] + new_block + text[end:]
+
+old_graph = '<div className="timeline-bars">{result.timeline.map((score, index) => <div key={index} style={{ height: `${Math.max(score, 8)}%` }} title={`Window ${index + 1}: ${score}`} />)}</div>'
+new_graph = '''<div className="timeline-graph" aria-label="Live synthetic score timeline">
+              <svg viewBox="0 0 400 130" role="img" aria-label="Synthetic score by analysis window" style={{ width: "100%", height: "170px", display: "block", color: "#c6e93d" }}>
+                <line x1="0" y1="20" x2="400" y2="20" stroke="currentColor" strokeOpacity=".12" />
+                <line x1="0" y1="65" x2="400" y2="65" stroke="currentColor" strokeOpacity=".12" />
+                <line x1="0" y1="110" x2="400" y2="110" stroke="currentColor" strokeOpacity=".12" />
+                {result.timeline.length > 0 && (() => {
+                  const denominator = Math.max(result.timeline.length - 1, 1);
+                  const points = result.timeline.map((score, index) => {
+                    const x = (index / denominator) * 400;
+                    const y = 110 - (Math.max(0, Math.min(score, 100)) * 0.9);
+                    return { x, y, score, index };
+                  });
+                  return (
+                    <>
+                      <polyline fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" points={points.map((point) => `${point.x},${point.y}`).join(" ")} />
+                      {points.map((point) => (
+                        <circle key={point.index} cx={point.x} cy={point.y} r="4.5" fill="currentColor">
+                          <title>{`Window ${point.index + 1}: ${point.score}`}</title>
+                        </circle>
+                      ))}
+                    </>
+                  );
+                })()}
+              </svg>
+            </div>'''
+if old_graph not in text:
+    raise SystemExit("Could not find timeline graph markup")
+text = text.replace(old_graph, new_graph, 1)
+
+path.write_text(text, encoding="utf-8")
+print("Patched live microphone streaming and real-time graph")

@@ -1,0 +1,260 @@
+name: VOXY final detection integration
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ !contains(github.event.head_commit.message, 'fix: finish detection integration') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Patch model score and frontend transport
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          # AASIST's published Arena score is the bona-fide logit. VOXY needs a
+          # synthetic-signal value, so use the two-logit margin rather than a
+          # sigmoid of one logit that collapses many inputs to ~4/100.
+          p = Path('backend/app/ml/inference.py')
+          s = p.read_text(encoding='utf-8')
+          old = '''            # Official AASIST wrapper: logits[:, 1] is bona fide, and higher
+            # bona-fide evidence means lower synthetic likelihood. Use the
+            # monotonic transform of that score for VOXY's 0-100 scale.
+            synthetic_probability = 1.0 / (1.0 + np.exp(np.clip(bona_fide_logit, -60.0, 60.0)))
+            spoof_score = float(synthetic_probability * 100.0)
+'''
+          new = '''            # Use the full two-class logit margin. This preserves the official
+            # class direction while avoiding saturation caused by sigmoid(-bona_fide)
+            # for scores that are close together. The result is a deterministic
+            # synthetic-signal scale, not a calibrated probability.
+            margin = spoof_logit - bona_fide_logit
+            spoof_score = float(50.0 + 50.0 * np.tanh(margin / 1.5))
+            spoof_score = float(np.clip(spoof_score, 0.0, 100.0))
+'''
+          if old not in s:
+              raise SystemExit('AASIST scoring block not found')
+          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+
+          meta = Path('models/model_metadata.json')
+          ms = meta.read_text(encoding='utf-8')
+          ms = ms.replace(
+              '"score_direction": "VOXY synthetic score is sigmoid(-bonafide_logit) * 100; higher means more synthetic/spoof signal"',
+              '"score_direction": "VOXY synthetic signal = 50 + 50*tanh((spoof_logit - bonafide_logit)/1.5); higher means more spoof evidence; not a calibrated probability"',
+          )
+          meta.write_text(ms, encoding='utf-8')
+
+          # Keep the UI's labelled demo values internally consistent too.
+          page = Path('frontend/app/page.tsx')
+          s = page.read_text(encoding='utf-8')
+          s = s.replace('human: { status: "human", synthetic_score: 18, risk_score: 12,', 'human: { status: "human", synthetic_score: 18, risk_score: 18,', 1)
+          s = s.replace('synthetic: { status: "suspicious", synthetic_score: 91, risk_score: 88,', 'synthetic: { status: "suspicious", synthetic_score: 91, risk_score: 91,', 1)
+          s = s.replace('uncertain: { status: "uncertain", synthetic_score: 52, risk_score: 43,', 'uncertain: { status: "uncertain", synthetic_score: 52, risk_score: 52,', 1)
+          s = s.replace('  timeline: number[];\n};', '  timeline: number[];\n  inference_ms?: number;\n};', 1)
+
+          # Upload: bounded retries for cold starts and transient fetch failures.
+          upload_re = re.compile(r'  async function analyzeFile\(file\?: File\) \{.*?\n  \}\n\n  function chooseDemo', re.S)
+          upload = '''  async function analyzeFile(file?: File) {
+    if (!file) return;
+    setBusy(true);
+    setAnalysisError(null);
+    setLiveError(null);
+    setResult({ ...liveListeningResult, mode: "live", model_message: `UPLOADING · ${file.name} · AASIST analysis in progress...` });
+    scrollToSection("analyze");
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 180000);
+    try {
+      if (!API) throw new Error("Backend URL is missing. Set NEXT_PUBLIC_API_URL and rebuild the frontend.");
+      let response: Response | null = null;
+      let lastError: unknown = null;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          const body = new FormData();
+          body.append("audio", file);
+          response = await fetch(`${API}/api/analyze`, { method: "POST", body, signal: controller.signal, cache: "no-store" });
+          if (response.ok) break;
+        } catch (error) {
+          lastError = error;
+        }
+        if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 1500));
+      }
+      if (!response) throw new Error(lastError instanceof Error ? `${lastError.message} · ${API}` : `Failed to reach VOXY backend · ${API}`);
+      if (!response.ok) {
+        let message = `Audio analysis failed (${response.status}).`;
+        try { const payload = await response.json() as { detail?: string }; if (payload.detail) message = payload.detail; } catch {}
+        throw new Error(message);
+      }
+      setResult(await response.json() as Result);
+    } catch (error) {
+      setAnalysisError(error instanceof DOMException && error.name === "AbortError" ? "Audio analysis timed out after 180 seconds." : error instanceof Error ? error.message : "Audio analysis failed.");
+    } finally {
+      window.clearTimeout(timeout);
+      setBusy(false);
+    }
+  }
+
+  function chooseDemo'''
+          s, count = upload_re.subn(upload, s, count=1)
+          if count != 1:
+              raise SystemExit('upload function marker missing')
+
+          # Replace WebSocket transport with ordinary HTTPS for live inference.
+          # The waveform and PCM capture stay unchanged. Only the model transport
+          # changes, eliminating proxy/WebSocket failure as a live-demo blocker.
+          live_re = re.compile(r'  async function startLiveSimulation\(\) \{.*?\n  \}\n\n  const title = busy', re.S)
+          live = '''  async function startLiveSimulation() {
+    setLiveError(null);
+    setAnalysisError(null);
+    setResult(liveListeningResult);
+    pcmChunks.current = [];
+    pcmSampleCount.current = 0;
+    modelRequestPending.current = false;
+    if (!API) { setLiveError("Backend URL is missing. Set NEXT_PUBLIC_API_URL and rebuild the frontend."); return; }
+    if (!navigator.mediaDevices?.getUserMedia || !window.AudioContext) { setLiveError("This browser does not support live microphone analysis."); return; }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const context = new AudioContext({ sampleRate: LIVE_SAMPLE_RATE });
+      await context.resume();
+      const source = context.createMediaStreamSource(stream);
+      const analyserNode = context.createAnalyser();
+      analyserNode.fftSize = 2048;
+      analyserNode.smoothingTimeConstant = 0.12;
+      const processor = context.createScriptProcessor(4096, 1, 1);
+      const silent = context.createGain();
+      silent.gain.value = 0;
+      source.connect(analyserNode);
+      source.connect(processor);
+      processor.connect(silent);
+      silent.connect(context.destination);
+      mediaStream.current = stream;
+      audioContext.current = context;
+      audioSource.current = source;
+      analyser.current = analyserNode;
+      pcmProcessor.current = processor;
+      silentGain.current = silent;
+      intentionalStop.current = false;
+
+      const drawWaveform = () => {
+        const canvas = waveformCanvas.current;
+        const current = analyser.current;
+        if (!canvas || !current) return;
+        const dpr = window.devicePixelRatio || 1;
+        const width = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+        const height = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+        if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        const data = new Uint8Array(current.fftSize);
+        current.getByteTimeDomainData(data);
+        ctx.clearRect(0, 0, width, height);
+        ctx.strokeStyle = "rgba(198,233,61,.95)";
+        ctx.lineWidth = Math.max(1.5, dpr * 1.5);
+        ctx.beginPath();
+        const dx = width / data.length;
+        for (let index = 0; index < data.length; index += 1) {
+          const x = index * dx;
+          const y = height / 2 + ((data[index] - 128) / 128) * height * 0.42;
+          if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+        waveformFrame.current = window.requestAnimationFrame(drawWaveform);
+      };
+
+      processor.onaudioprocess = (event) => {
+        const copy = new Float32Array(event.inputBuffer.getChannelData(0));
+        pcmChunks.current.push(copy);
+        pcmSampleCount.current += copy.length;
+        const keep = Math.ceil(context.sampleRate * (LIVE_WINDOW_SECONDS + 0.5));
+        while (pcmChunks.current.length > 1 && pcmSampleCount.current > keep) {
+          const removed = pcmChunks.current.shift();
+          if (removed) pcmSampleCount.current -= removed.length;
+        }
+      };
+
+      const buildWindow = () => {
+        const needed = Math.ceil(context.sampleRate * LIVE_WINDOW_SECONDS);
+        if (pcmSampleCount.current < needed) return null;
+        const joined = new Float32Array(pcmSampleCount.current);
+        let offset = 0;
+        for (const chunk of pcmChunks.current) { joined.set(chunk, offset); offset += chunk.length; }
+        const recent = joined.subarray(Math.max(0, joined.length - needed));
+        return context.sampleRate === LIVE_SAMPLE_RATE ? downsampleToTarget(recent) : downsampleToTarget(recent);
+      };
+
+      const sendWindow = async () => {
+        if (modelRequestPending.current) return;
+        const samples = buildWindow();
+        if (!samples) return;
+        modelRequestPending.current = true;
+        try {
+          const response = await fetch(`${API}/api/live`, {
+            method: "POST",
+            headers: { "Content-Type": "audio/wav" },
+            body: encodeWav(samples, LIVE_SAMPLE_RATE),
+            cache: "no-store",
+          });
+          if (!response.ok) {
+            let message = `Live analysis failed (${response.status}).`;
+            try { const payload = await response.json() as { detail?: string }; if (payload.detail) message = payload.detail; } catch {}
+            throw new Error(message);
+          }
+          const update = await response.json() as Result & { inference_ms?: number };
+          setResult({
+            ...update,
+            mode: "pretrained",
+            model_message: update.inference_ms ? `LIVE MODEL ANALYSIS · real AASIST window · ${update.inference_ms} ms` : "LIVE MODEL ANALYSIS · real AASIST window",
+          });
+          setLiveError(null);
+        } catch (error) {
+          setLiveError(error instanceof Error ? error.message : "Live model request failed.");
+        } finally {
+          modelRequestPending.current = false;
+        }
+      };
+
+      setLiveSeconds(0);
+      setLiveActive(true);
+      waveformFrame.current = window.requestAnimationFrame(drawWaveform);
+      snapshotTimer.current = window.setInterval(() => { void sendWindow(); }, 500);
+    } catch (error) {
+      setLiveError(error instanceof DOMException && error.name === "NotAllowedError" ? "Microphone permission was denied." : error instanceof Error ? error.message : "Unable to start microphone analysis.");
+      stopLiveSimulation();
+    }
+  }
+
+  const title = busy'''
+          s, count = live_re.subn(live, s, count=1)
+          if count != 1:
+              raise SystemExit('live function marker missing')
+
+          s = s.replace('synthetic likelihood · model score, not a calibrated probability', 'synthetic signal · AASIST margin score; higher means more spoof evidence', 1)
+          page.write_text(s, encoding='utf-8')
+
+      - name: Validate
+        shell: bash
+        run: |
+          python -m py_compile backend/app/main.py backend/app/ml/inference.py backend/app/ml/preprocessing.py backend/app/risk/engine.py
+          cd frontend
+          npm ci
+          npm run build
+
+      - name: Commit and remove workflow
+        shell: bash
+        run: |
+          git config user.name "VOXY automation"
+          git config user.email "actions@users.noreply.github.com"
+          git add backend/app/ml/inference.py models/model_metadata.json frontend/app/page.tsx .github/workflows/final-detection-integration.yml
+          git commit -m "fix: finish detection integration"
+          git rm .github/workflows/final-detection-integration.yml
+          git commit -m "chore: remove detection integration workflow"
+          git push origin main

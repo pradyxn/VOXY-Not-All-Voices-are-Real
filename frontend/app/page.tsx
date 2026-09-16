@@ -2,8 +2,13 @@
 
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, ArrowRight, Check, FileAudio, LockKeyhole, Mic, Moon, Play, ShieldCheck, Sun, Upload, Waves, X } from "lucide-react";
+import { getWebSocketUrl } from "./websocket";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API = process.env.NEXT_PUBLIC_API_URL?.trim() || (process.env.NODE_ENV === "development" ? "http://localhost:8000" : "");
+
+function logWebSocket(message: string, details?: unknown) {
+  if (process.env.NODE_ENV === "development") console.info(`[VOXY WebSocket] ${message}`, details ?? "");
+}
 
 type Result = {
   status: string;
@@ -50,6 +55,7 @@ export default function Home() {
   const mediaRecorder = useRef<MediaRecorder | null>(null);
   const mediaStream = useRef<MediaStream | null>(null);
   const socket = useRef<WebSocket | null>(null);
+  const intentionalStop = useRef(false);
   const [verification, setVerification] = useState(false);
   const [activeStep, setActiveStep] = useState(0);
 
@@ -93,6 +99,7 @@ export default function Home() {
     setAnalysisError(null);
     scrollToSection("analyze");
     try {
+      if (!API) throw new Error("Backend URL is missing. Set NEXT_PUBLIC_API_URL and rebuild the frontend.");
       const body = new FormData();
       body.append("audio", file);
       const response = await fetch(`${API}/api/analyze`, { method: "POST", body });
@@ -120,8 +127,9 @@ export default function Home() {
     scrollToSection("analyze");
   }
 
-  function stopLiveSimulation() {
-    mediaRecorder.current?.stop();
+  function stopLiveSimulation(silent = false) {
+    intentionalStop.current = silent;
+    if (mediaRecorder.current && mediaRecorder.current.state !== "inactive") mediaRecorder.current.stop();
     mediaStream.current?.getTracks().forEach((track) => track.stop());
     socket.current?.close();
     mediaRecorder.current = null;
@@ -141,24 +149,40 @@ export default function Home() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "";
       const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
-      const liveSocket = new WebSocket(`${API.replace(/^http/, "ws")}/ws/analyze`);
+      const webSocketUrl = getWebSocketUrl(API, window.location.protocol);
+      logWebSocket("attempting connection", webSocketUrl);
+      const liveSocket = new WebSocket(webSocketUrl);
       mediaStream.current = stream;
       mediaRecorder.current = recorder;
       socket.current = liveSocket;
       liveSocket.onopen = () => {
+        logWebSocket("onopen");
+        intentionalStop.current = false;
         setLiveSeconds(0);
         setLiveActive(true);
         recorder.start(1000);
       };
       liveSocket.onmessage = (event) => {
+        logWebSocket("onmessage", { bytes: event.data instanceof Blob ? event.data.size : undefined });
         const update = JSON.parse(event.data) as Result;
         setResult({ ...update, mode: "pretrained", model_message: "LIVE MODEL ANALYSIS - AASIST pretrained anti-spoofing model" });
       };
       liveSocket.onerror = () => {
-        setLiveError("The analysis server is unavailable.");
-        stopLiveSimulation();
+        logWebSocket("onerror", "Network error or connection refused");
       };
-      liveSocket.onclose = () => {
+      liveSocket.onclose = (event) => {
+        logWebSocket("onclose", { code: event.code, reason: event.reason });
+        if (intentionalStop.current || event.code === 1000) {
+          setLiveError(null);
+        } else if (event.code === 1011 && event.reason.toLowerCase().includes("detector")) {
+          setLiveError("Backend closed the connection because the AASIST detector is unavailable.");
+        } else if (event.code === 1006) {
+          setLiveError("WebSocket connection refused or interrupted. Check that the backend is running and reachable.");
+        } else if (event.reason) {
+          setLiveError(`Backend closed the live connection (${event.code}): ${event.reason}`);
+        } else {
+          setLiveError(`Live connection closed unexpectedly (code ${event.code}).`);
+        }
         mediaStream.current?.getTracks().forEach((track) => track.stop());
         setLiveActive(false);
       };
@@ -167,7 +191,7 @@ export default function Home() {
       };
       recorder.onerror = () => setLiveError("Microphone recording stopped unexpectedly.");
     } catch (error) {
-      setLiveError(error instanceof DOMException && error.name === "NotAllowedError" ? "Microphone permission was denied." : "No usable microphone was found.");
+      setLiveError(error instanceof DOMException && error.name === "NotAllowedError" ? "Microphone permission was denied." : error instanceof Error ? error.message : "Unable to start microphone analysis.");
       stopLiveSimulation();
     }
   }
@@ -248,7 +272,7 @@ export default function Home() {
 
         <section className="vxy-section analyze-section reveal" id="analyze">
           <div className="section-heading"><div><span className="kicker">Live workspace</span><h2>Analyze a voice.</h2></div><p>Upload an audio clip or choose a labelled simulation. Demo values are never presented as genuine model predictions.</p></div>
-          <div className="analyze-layout"><div className="upload-card"><div className="card-title"><FileAudio size={20} /><h3>Voice input</h3></div><p className="muted">WAV, MP3, M4A, or browser WebM. Audio is processed temporarily.</p><label className="dropzone"><Upload size={27} /><strong>Choose a recording</strong><span>Send it to the VOXY pipeline</span><input type="file" accept="audio/*" onChange={(event) => analyzeFile(event.target.files?.[0])} /></label><div className="demo-row"><button onClick={() => chooseDemo("human")}>Human / demo</button><button onClick={() => chooseDemo("synthetic")}>Synthetic / demo</button><button onClick={() => chooseDemo("uncertain")}>Uncertain / demo</button></div><button className="text-action" onClick={() => { if (liveActive) stopLiveSimulation(); else setCallOpen(!callOpen); }}><Mic size={16} /> {liveActive ? "Stop microphone simulation" : callOpen ? "Close microphone simulation" : "Open microphone simulation"}</button>{callOpen && <div className="inline-note"><strong>Browser Microphone Simulation</strong><p>Audio is streamed to VOXY for live AASIST analysis. It does not intercept cellular calls.</p>{liveActive ? <p className="live-status"><span className="live-dot" /> Listening · {liveSeconds}s</p> : <button className="vxy-pill primary" onClick={startLiveSimulation}>Start microphone analysis</button>}{liveError && <p role="alert">{liveError}</p>}</div>}</div>
+          <div className="analyze-layout"><div className="upload-card"><div className="card-title"><FileAudio size={20} /><h3>Voice input</h3></div><p className="muted">WAV, MP3, M4A, or browser WebM. Audio is processed temporarily.</p><label className="dropzone"><Upload size={27} /><strong>Choose a recording</strong><span>Send it to the VOXY pipeline</span><input type="file" accept="audio/*" onChange={(event) => analyzeFile(event.target.files?.[0])} /></label><div className="demo-row"><button onClick={() => chooseDemo("human")}>Human / demo</button><button onClick={() => chooseDemo("synthetic")}>Synthetic / demo</button><button onClick={() => chooseDemo("uncertain")}>Uncertain / demo</button></div><button className="text-action" onClick={() => { if (liveActive) stopLiveSimulation(true); else setCallOpen(!callOpen); }}><Mic size={16} /> {liveActive ? "Stop microphone simulation" : callOpen ? "Close microphone simulation" : "Open microphone simulation"}</button>{callOpen && <div className="inline-note"><strong>Browser Microphone Simulation</strong><p>Audio is streamed to VOXY for live AASIST analysis. It does not intercept cellular calls.</p>{liveActive ? <p className="live-status"><span className="live-dot" /> Listening · {liveSeconds}s</p> : <button className="vxy-pill primary" onClick={startLiveSimulation}>Start microphone analysis</button>}{liveError && <p role="alert">{liveError}</p>}</div>}</div>
             <div className="result-card" aria-live="polite"><div className="result-top"><div><span className="kicker">Voice assessment</span><h3>{title}</h3></div><span className="badge">{result.mode === "demo" ? "SIMULATION" : result.risk_level}</span></div><div className="score">{Math.round(result.synthetic_score)}<span>/100</span></div><p className="muted">synthetic likelihood · model score, not a calibrated probability</p>{result.detector && result.mode !== "demo" && <p className="detector-label">{result.detector}</p>}<div className="meter"><i style={{ width: `${result.synthetic_score}%` }} /></div><div className="metrics"><div><small>Risk score</small><strong>{result.risk_score}</strong></div><div><small>Risk level</small><strong>{result.risk_level}</strong></div><div><small>Windows</small><strong>{result.windows_analyzed}</strong></div></div><div className="timeline-bars">{result.timeline.map((score, index) => <div key={index} style={{ height: `${Math.max(score, 8)}%` }} title={`Window ${index + 1}: ${score}`} />)}</div>{result.risk_score >= 60 && <div className="verify-note"><strong>Verify before taking action.</strong><p>Ask a trusted question, contact the person through another channel, and do not share OTPs or transfer money based on the call alone.</p><button className="vxy-pill primary" onClick={() => setVerification(!verification)}>{verification ? <><Check size={15} /> Steps shown</> : "Verify caller"}</button>{verification && <p><Check size={15} /> End the call, use a trusted contact method, and independently confirm identity.</p>}</div>}<p className="model-message">{analysisError || result.model_message}</p></div></div>
         </section>
 

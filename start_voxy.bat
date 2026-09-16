@@ -7,7 +7,7 @@ if errorlevel 1 (
   exit /b 1
 )
 if not exist "backend\.venv\Scripts\python.exe" call "backend\setup.bat"
-start "VOXY Backend" cmd /k "cd /d \"%~dp0backend\" && call \".venv\Scripts\activate.bat\" && uvicorn app.main:app --reload --port 8000"
+start "VOXY Backend" cmd /k "cd /d \"%~dp0backend\" && call \".venv\Scripts\activate.bat\" && uvicorn app.main:app --reload --port 8000 --ws-ping-interval 20 --ws-ping-timeout 60"
 cd /d "%~dp0frontend"
 if not exist "node_modules" call npm install
 start "VOXY Frontend" cmd /k "cd /d \"%~dp0frontend\" && npm run dev"

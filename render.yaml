@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: voxy-backend
+    runtime: python
+    buildCommand: pip install -r backend/requirements.txt && python setup_model.py
+    startCommand: uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port $PORT --ws-ping-interval 20 --ws-ping-timeout 60
+    envVars:
+      - key: VOXY_FRONTEND_ORIGIN
+        sync: false

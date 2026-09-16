@@ -12,4 +12,4 @@ if errorlevel 1 (
   echo Install it from https://ffmpeg.org/download.html and reopen this terminal.
   exit /b 1
 )
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --reload --port 8000 --ws-ping-interval 20 --ws-ping-timeout 60

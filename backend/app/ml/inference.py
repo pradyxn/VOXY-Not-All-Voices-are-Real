@@ -4,6 +4,7 @@ import torch
 from .preprocessing import load_audio, quality_check, split_windows
 from ..config import MAX_WINDOWS, MODEL_PATH, SAMPLE_RATE, TARGET_SAMPLES, WINDOW_HOP_SAMPLES
 
+
 class InferenceService:
     def __init__(self) -> None:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -85,13 +86,25 @@ class InferenceService:
     def predict_window_details(self, audio: np.ndarray) -> tuple[float, float, float]:
         if not self.loaded or self.session is None:
             raise RuntimeError("AASIST detector is not loaded")
+
         waveform = np.asarray(pad_waveform(audio), dtype=np.float32)[None, :]
         with torch.inference_mode():
             logits = self.session.run(None, {self.session.get_inputs()[0].name: waveform})[0]
-            bona_fide_logit = float(logits[0, 0])
-            spoof_logit = float(logits[0, 1])
-            spoof_score = 1.0 / (1.0 + np.exp(bona_fide_logit - spoof_logit))
-        return bona_fide_logit, spoof_logit, round(float(spoof_score * 100), 1)
+
+            # The official AASIST training protocol uses label 0 = spoof and
+            # label 1 = bona fide. Therefore class 0 is the synthetic/impersonation
+            # probability and class 1 is bona-fide. Keep this mapping explicit so
+            # a real voice produces a low synthetic score rather than the inverse.
+            logits = np.asarray(logits, dtype=np.float32)
+            if logits.shape != (1, 2):
+                raise RuntimeError(f"Unexpected AASIST output shape: {logits.shape}")
+            shifted = logits[0] - float(np.max(logits[0]))
+            probabilities = np.exp(shifted) / np.sum(np.exp(shifted))
+            spoof_score = float(probabilities[0] * 100.0)
+            bona_fide_logit = float(logits[0, 1])
+            spoof_logit = float(logits[0, 0])
+
+        return bona_fide_logit, spoof_logit, round(spoof_score, 1)
 
     @property
     def provider(self) -> str:
@@ -100,6 +113,7 @@ class InferenceService:
     @property
     def device_name(self) -> str:
         return "CUDA" if self.provider == "CUDAExecutionProvider" else "CPU"
+
 
 def pad_waveform(audio: np.ndarray) -> np.ndarray:
     if len(audio) >= TARGET_SAMPLES:

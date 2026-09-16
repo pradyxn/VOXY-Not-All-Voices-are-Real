@@ -1,0 +1,82 @@
+name: VOXY final score and theme fix
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ !contains(github.event.head_commit.message, 'fix: align risk score and theme') && !contains(github.event.head_commit.message, 'chore: remove final score theme workflow') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Apply deterministic production fixes
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          # 1) Risk score must equal the displayed synthetic score exactly.
+          risk = Path('backend/app/risk/engine.py')
+          risk.write_text('''from ..config import RISK_THRESHOLDS\n\n\ndef calculate_risk(synthetic_score: float, windows: int, stability: float, audio_quality: str) -> tuple[int, str]:\n    """Map the model's 0-100 synthetic score directly to the user-facing risk score.\n\n    The UI intentionally shows one risk signal everywhere. Evidence/stability still\n    remain available as separate telemetry, but they no longer distort the displayed\n    risk number (e.g. 30 becoming 22).\n    """\n    if audio_quality == "insufficient":\n        return 0, "LOW"\n    risk = round(max(0.0, min(100.0, float(synthetic_score))))\n    if risk >= RISK_THRESHOLDS["critical"]:\n        level = "CRITICAL"\n    elif risk >= RISK_THRESHOLDS["high"]:\n        level = "HIGH"\n    elif risk >= RISK_THRESHOLDS["moderate"]:\n        level = "MODERATE"\n    else:\n        level = "LOW"\n    return risk, level\n''', encoding='utf-8')
+
+          # 2) Use the official AASIST bona-fide logit as the primary reference.
+          # Higher bona-fide logit => lower synthetic likelihood. This avoids letting
+          # a small class-logit ordering difference make a natural voice look fully
+          # synthetic while still preserving a deterministic 0-100 score.
+          inf = Path('backend/app/ml/inference.py')
+          s = inf.read_text(encoding='utf-8')
+          old = '''            shifted = logits[0] - float(np.max(logits[0]))\n            probabilities = np.exp(shifted) / np.sum(np.exp(shifted))\n            spoof_score = float(probabilities[0] * 100.0)\n            bona_fide_logit = float(logits[0, 1])\n            spoof_logit = float(logits[0, 0])\n\n        return bona_fide_logit, spoof_logit, round(spoof_score, 1)\n'''
+          new = '''            bona_fide_logit = float(logits[0, 1])\n            spoof_logit = float(logits[0, 0])\n\n            # Official AASIST scoring treats logits[:, 1] as the bona-fide score.\n            # Convert that monotonic evidence into VOXY's synthetic-likelihood scale:\n            # high bona-fide evidence -> low synthetic score.\n            synthetic_probability = 1.0 / (1.0 + np.exp(np.clip(bona_fide_logit, -60.0, 60.0)))\n            spoof_score = float(synthetic_probability * 100.0)\n\n        return bona_fide_logit, spoof_logit, round(spoof_score, 1)\n'''
+          if old not in s:
+              raise SystemExit('inference scoring block not found')
+          inf.write_text(s.replace(old, new, 1), encoding='utf-8')
+
+          metadata = Path('models/model_metadata.json')
+          m = metadata.read_text(encoding='utf-8')
+          m = re.sub(r'"score_direction":\s*"[^"]+"', '"score_direction": "VOXY synthetic score is sigmoid(-bonafide_logit) * 100; higher means more synthetic/spoof signal",', m)
+          metadata.write_text(m, encoding='utf-8')
+
+          # 3) Verify-caller panel uses the same synthetic/risk number and gives
+          # concrete, actionable steps without changing the surrounding layout.
+          page = Path('frontend/app/page.tsx')
+          s = page.read_text(encoding='utf-8')
+          old_verify = '''{result.risk_score >= 60 && <div className="verify-note"><strong>Verify before taking action.</strong><p>Ask a trusted question, contact the person through another channel, and do not share OTPs or transfer money based on the call alone.</p><button className="vxy-pill primary" onClick={() => setVerification(!verification)}>{verification ? <><Check size={15} /> Steps shown</> : "Verify caller"}</button>{verification && <p><Check size={15} /> End the call, use a trusted contact method, and independently confirm identity.</p>}</div>}'''
+          new_verify = '''{result.synthetic_score >= 60 && <div className="verify-note"><div className="verify-head"><div><strong>Verification recommended</strong><p>VOXY detected a higher synthetic-voice signal. Confirm the caller before sharing sensitive information.</p></div><span className="verify-score">{Math.round(result.synthetic_score)}/100</span></div><button className="vxy-pill primary verify-button" onClick={() => setVerification(!verification)}>{verification ? <><Check size={15} /> Hide steps</> : "Verify caller"}</button>{verification && <div className="verify-steps"><p><strong>1.</strong> End the call if identity is uncertain.</p><p><strong>2.</strong> Call the person back using a number you already trust.</p><p><strong>3.</strong> Never share OTPs, passwords, or payment details from the suspicious call.</p><p><strong>4.</strong> Confirm any urgent request through a second channel.</p></div>}</div>}'''
+          if old_verify not in s:
+              raise SystemExit('verify block not found')
+          s = s.replace(old_verify, new_verify, 1)
+
+          # 4) Guarantee identical typography between light and dark dashboard modes.
+          style_marker = '''        .theme-toggle{white-space:nowrap}\n'''
+          style_add = '''        .vxy-shell.theme-light,.vxy-shell.theme-dark{font-family:'Inter',sans-serif}\n        .vxy-shell.theme-light h1,.vxy-shell.theme-light h2,.vxy-shell.theme-light h3,.vxy-shell.theme-light h4,.vxy-shell.theme-light .vxy-title,.vxy-shell.theme-light .section-heading h2,.vxy-shell.theme-dark h1,.vxy-shell.theme-dark h2,.vxy-shell.theme-dark h3,.vxy-shell.theme-dark h4,.vxy-shell.theme-dark .vxy-title,.vxy-shell.theme-dark .section-heading h2{font-family:'Bricolage Grotesque',sans-serif}\n        .vxy-shell.theme-light button,.vxy-shell.theme-light input,.vxy-shell.theme-light textarea,.vxy-shell.theme-dark button,.vxy-shell.theme-dark input,.vxy-shell.theme-dark textarea{font-family:'Inter',sans-serif}\n        .verify-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}\n        .verify-head p{margin:5px 0 0}\n        .verify-score{font-weight:800;white-space:nowrap}\n        .verify-button{margin-top:10px}\n        .verify-steps{margin-top:12px;display:grid;gap:7px}\n        .verify-steps p{margin:0}\n'''
+          if style_marker not in s:
+              raise SystemExit('theme style marker not found')
+          s = s.replace(style_marker, style_marker + style_add, 1)
+          page.write_text(s, encoding='utf-8')
+
+      - name: Validate backend and frontend
+        shell: bash
+        run: |
+          python -m py_compile backend/app/main.py backend/app/ml/inference.py backend/app/ml/preprocessing.py backend/app/risk/engine.py
+          cd frontend
+          npm ci
+          npm run build
+
+      - name: Commit final fix and remove workflow
+        shell: bash
+        run: |
+          git config user.name "VOXY automation"
+          git config user.email "actions@users.noreply.github.com"
+          git add backend/app/risk/engine.py backend/app/ml/inference.py models/model_metadata.json frontend/app/page.tsx
+          git commit -m "fix: align risk score and theme"
+          git rm .github/workflows/final-score-theme-fix.yml
+          git commit -m "chore: remove final score theme workflow"
+          git push origin main
